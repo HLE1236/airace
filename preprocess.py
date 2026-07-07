@@ -1,6 +1,8 @@
 import argparse
 import os
 import shutil
+import tempfile
+import pycolmap
 from pathlib import Path
 
 from utils.read_write_model import (
@@ -12,60 +14,89 @@ from utils.read_write_model import (
     write_points3D_binary,
 )
 
-def preprocess_scene(path, output_dir):
+def preprocess_scene(scene_path):
 
-    path = Path(path)
-    output_dir = Path(output_dir)
+    scene_path = Path(scene_path)
 
-    images_dir = path / "train" / "images"
-    sparse_path = path / "train" / "sparse" / "0"
+    images_dir = scene_path / "train" / "images"
+    sparse_path = scene_path / "train" / "sparse" / "0"
 
     cameras = read_cameras_binary(str(sparse_path / "cameras.bin"))
     images = read_images_binary(str(sparse_path / "images.bin"))
     points3D = read_points3D_binary(str(sparse_path / "points3D.bin"))
 
-    # images that actualy exsist in images dir
     existing_files = set(os.listdir(images_dir))
 
-    # extrinsics that do not have exsisting images
-    missing_ids = [img_id for img_id, img in images.items() if img.name not in existing_files]
+    # dùng set để tra cứu O(1)
+    missing_ids = {
+        img_id
+        for img_id, img in images.items()
+        if img.name not in existing_files
+    }
 
-    print(f"scene: {path.name}")
+    print(f"scene: {scene_path.name}")
     print(f"Tổng ảnh: {len(images)}")
     print(f"Số ảnh missing: {len(missing_ids)}")
 
-    # Xóa hẳn khỏi dict images
     for img_id in missing_ids:
         del images[img_id]
 
     print(f"Còn lại sau khi xóa: {len(images)}")
 
-    # Dọn point3D: xóa các observation trỏ tới ảnh đã xóa, xóa point nếu track rỗng
     removed_points = 0
     for pt_id in list(points3D.keys()):
         pt = points3D[pt_id]
 
-        # delete observations of images that is not exsist 
         keep_mask = [img_id not in missing_ids for img_id in pt.image_ids]
 
-        # delete if none of the observation exsist
         if not any(keep_mask):
             del points3D[pt_id]
             removed_points += 1
         elif not all(keep_mask):
             new_image_ids = pt.image_ids[keep_mask]
             new_point2D_idxs = pt.point2D_idxs[keep_mask]
-            points3D[pt_id] = pt._replace(image_ids=new_image_ids, point2D_idxs=new_point2D_idxs)
+            points3D[pt_id] = pt._replace(
+                image_ids=new_image_ids,
+                point2D_idxs=new_point2D_idxs,
+            )
 
     print(f"Đã xóa {removed_points} points3D không còn observation nào")
     print(f"Points3D còn lại: {len(points3D)}")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_cameras_binary(cameras, str(output_dir / "cameras.bin"))
-    write_images_binary(images, str(output_dir / "images.bin"))
-    write_points3D_binary(points3D, str(output_dir / "points3D.bin"))
-    print(f"Đã ghi kết quả tại: {output_dir}")
+    # ghi đè luôn
+    write_cameras_binary(cameras, str(sparse_path / "cameras.bin"))
+    write_images_binary(images, str(sparse_path / "images.bin"))
+    write_points3D_binary(points3D, str(sparse_path / "points3D.bin"))
 
+    print(f"Đã cập nhật reconstruction.")
+
+def undistort_scene(scene_path):
+    scene_path = Path(scene_path)
+
+    image_dir = scene_path / "train" / "images"
+    sparse_dir = scene_path / "train" / "sparse" / "0"
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="undistort_"))
+
+    print(f"Undistorting {scene_path.name}...")
+
+    try:
+        pycolmap.undistort_images(
+            output_path=str(tmp_dir),
+            input_path=str(sparse_dir),
+            image_path=str(image_dir),
+        )
+
+        # Thay ảnh
+        shutil.rmtree(image_dir)
+        shutil.copytree(tmp_dir / "images", image_dir)
+
+        # Thay sparse
+        shutil.rmtree(sparse_dir)
+        shutil.copytree(tmp_dir / "sparse", sparse_dir)
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def preprocess_dataset(path, output_dir):
     path = Path(path)
@@ -74,9 +105,39 @@ def preprocess_dataset(path, output_dir):
     shutil.copytree(path, output_dir, dirs_exist_ok=True)
 
     for scene in os.listdir(path):
+        output_scene_path = output_dir / scene 
+        undistort_scene(output_scene_path)     
+        preprocess_scene(output_scene_path)  
+
+def validate(path):
+    path = Path(path)
+    for scene in os.listdir(path):
         scene_path = path / scene
-        ouput_scene_path = output_dir / scene / "train" / "sparse" / "0"
-        preprocess_scene(scene_path, ouput_scene_path)        
+        images_dir = scene_path / "train" / "images"
+        sparse_path = scene_path / "train" / "sparse" / "0"
+
+        cameras = read_cameras_binary(str(sparse_path / "cameras.bin"))
+        images = read_images_binary(str(sparse_path / "images.bin"))
+        points3D = read_points3D_binary(str(sparse_path / "points3D.bin"))
+
+        on_disk = set(os.listdir(images_dir))
+        registered = {img.name for img in images.values()}
+
+        missing = registered - on_disk
+        extra = on_disk - registered
+        non_pinhole = [c for c in cameras.values() if c.model != "PINHOLE"]
+
+        print(f"scene: {scene}")
+        print(f"  images (sparse/disk): {len(images)}/{len(on_disk)}")
+        print(f"  points3D: {len(points3D)}")
+        if missing:
+            print(f"  ⚠ missing on disk: {len(missing)} e.g. {list(missing)[:3]}")
+        if extra:
+            print(f"  ⚠ extra on disk (not in sparse): {len(extra)}")
+        if non_pinhole:
+            print(f"  ⚠ non-PINHOLE cameras (undistort may have failed): {len(non_pinhole)}")
+        if not missing and not extra and not non_pinhole:
+            print("  ✓ OK")
 
 
 if __name__ == "__main__":
@@ -99,5 +160,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     preprocess_dataset(args.input, args.output)
+    validate(args.output)
 
 # preprocess_dataset(r"C:\contest\VAR2026\phase1\private_set1", r"C:\contest\VAR2026\dataset")
