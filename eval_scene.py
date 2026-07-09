@@ -2,6 +2,7 @@ import os
 import json
 from pathlib import Path
 from argparse import ArgumentParser
+import lpips
 
 import torch
 import torchvision.transforms.functional as tf

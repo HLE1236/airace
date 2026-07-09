@@ -20,6 +20,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--cap_max", type=int, default=-1)
     args = parser.parse_args(sys.argv[1:])
 
     # Tự động ghép source_path từ input_dir + scene_name + train nếu chưa truyền tay
@@ -53,4 +54,5 @@ if __name__ == "__main__":
         args.checkpoint_iterations,
         args.start_checkpoint,
         args.debug_from,
+        args.cap_max
     )

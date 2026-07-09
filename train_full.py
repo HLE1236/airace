@@ -12,6 +12,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30000])
     parser.add_argument("--extra_args", nargs="*", default=[])
     parser.add_argument("--subset", nargs="+", default=[])
+    parser.add_argument("--cap_max", type=int, default=-1)
     args = parser.parse_args()
 
     # sort 
@@ -46,6 +47,7 @@ if __name__ == "__main__":
             "--iterations", str(args.iterations),
             "--test_iterations", *map(str, args.test_iterations),
             "--save_iterations", *map(str, args.save_iterations),
+            "--cap_max", str(args.cap_max)
         ] + args.extra_args
 
         ret = subprocess.run(cmd, env=env)

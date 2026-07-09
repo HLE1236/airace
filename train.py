@@ -22,6 +22,9 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
+from lpipsPyTorch import lpips
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -40,13 +43,24 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+# VAR: add cap max
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, cap_max=-1, analyse_path=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+
+    #VAR: add logger
+    analyse_file = None
+    if analyse_path is not None:
+        out_dir = os.path.dirname(analyse_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        analyse_file = open(analyse_path, "w")
+        analyse_file.write("iteration,L1,SSIM,LPIPS,PSNR,score\n")
+
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -148,8 +162,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
+            if analyse_file is not None and iteration % 100 == 0:
+                image_c = torch.clamp(image, 0.0, 1.0)
+                gt_image_c = torch.clamp(gt_image, 0.0, 1.0)
+                psnr_val = psnr(image_c, gt_image_c).mean().item()
+                lpips_val = lpips(image_c.unsqueeze(0), gt_image_c.unsqueeze(0), net_type='squeeze').item()
+                l1_val = Ll1.item()
+                ssim_val = ssim_value.item()
+                psnr_norm = torch.clamp(torch.tensor(psnr_val / 40.0), 0.0, 1.0).item()
+                score = 0.4 * (1 - lpips_val) + 0.3 * ssim_val + 0.3 * psnr_norm
+                analyse_file.write(f"{iteration},{l1_val:.6f},{ssim_val:.6f},{lpips_val:.6f},{psnr_val:.6f},{score:.6f}\n")
+                analyse_file.flush()
+                print(f"[ITER {iteration}] L1={l1_val:.4f} SSIM={ssim_val:.4f} LPIPS={lpips_val:.4f} PSNR={psnr_val:.2f} score={score:.4f}")
+
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                # VAR: log gaussians numbers 
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", "N": f"{gaussians.get_xyz.shape[0]}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -166,9 +194,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
+                # VAR: add capmax constraint 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    if cap_max <= 0 or gaussians.get_xyz.shape[0] < cap_max:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    else:
+                        prune_mask = (gaussians.get_opacity < 0.005).squeeze()
+                        gaussians.prune_points(prune_mask)
+                        torch.cuda.empty_cache()
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -188,6 +222,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+    if analyse_file is not None:
+        analyse_file.close()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -267,6 +303,9 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--cap_max", type=int, default=-1)
+    parser.add_argument("--analyse", type=str, default=None, help="Đường dẫn file log điểm số. Không truyền = không log.")
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -279,7 +318,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
-
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.cap_max, args.analyse)
+    
     # All done
     print("\nTraining complete.")
