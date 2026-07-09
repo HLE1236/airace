@@ -1,7 +1,3 @@
-#
-# Render VAR/Viettel AI Race test_poses.csv targets with a trained 3DGS model.
-#
-
 import csv
 import os
 from argparse import ArgumentParser
@@ -26,14 +22,6 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except Exception:
     SPARSE_ADAM_AVAILABLE = False
-
-
-def output_name(csv_image_name, keep_csv_extension):
-    image_name = Path(csv_image_name).name
-    if keep_csv_extension:
-        return image_name
-    return str(Path(image_name).with_suffix(".png"))
-
 
 def camera_from_csv_row(row, idx, data_device):
     width = int(float(row["width"]))
@@ -68,7 +56,6 @@ def camera_from_csv_row(row, idx, data_device):
         data_device=data_device,
     )
 
-
 def load_gaussians(dataset, iteration):
     gaussians = GaussianModel(dataset.sh_degree)
     loaded_iter = searchForMaxIteration(os.path.join(dataset.model_path, "point_cloud")) if iteration == -1 else iteration
@@ -84,10 +71,10 @@ def load_gaussians(dataset, iteration):
     gaussians.load_ply(ply_path, dataset.train_test_exp)
     return gaussians, loaded_iter
 
-
-def render_csv(dataset, pipeline, test_poses_csv, output_dir, scene_name, iteration, keep_csv_extension):
+def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration):
     gaussians, loaded_iter = load_gaussians(dataset, iteration)
     scene_dir = Path(output_dir) / scene_name
+    test_poses_csv = Path(input_dir) / scene_name / "test" / "test_poses.csv" 
     scene_dir.mkdir(parents=True, exist_ok=True)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -107,32 +94,31 @@ def render_csv(dataset, pipeline, test_poses_csv, output_dir, scene_name, iterat
                 use_trained_exp=dataset.train_test_exp,
                 separate_sh=SPARSE_ADAM_AVAILABLE,
             )["render"]
-            out_path = scene_dir / output_name(row["image_name"], keep_csv_extension)
+            out_path = scene_dir / row["image_name"]
             torchvision.utils.save_image(rendering, out_path)
             del camera, rendering
 
     print(f"Rendered {len(rows)} images for {scene_name} from iteration {loaded_iter} -> {scene_dir}")
 
-
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Render VAR/VAI NVS test poses with trained 3DGS")
+    parser = ArgumentParser(description="Render VAR scene with trained 3DGS")
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
+    parser.add_argument("--model_dir", default="/kaggle/working/model_outputs")
+    parser.add_argument("--input_dir", default="/kaggle/working/cleaned_inputs")
     parser.add_argument("--iteration", default=-1, type=int)
-    parser.add_argument("--test_poses_csv", required=True)
-    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--image_dir", default="/kaggle/working/image_outputs")
     parser.add_argument("--scene_name", required=True)
-    parser.add_argument("--keep_csv_extension", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+
     args = get_combined_args(parser)
 
     safe_state(args.quiet)
-    render_csv(
+    render_scene(
         model.extract(args),
         pipeline.extract(args),
-        args.test_poses_csv,
-        args.output_dir,
+        args.input_dir,
+        args.image_dir,
         args.scene_name,
         args.iteration,
-        args.keep_csv_extension,
     )

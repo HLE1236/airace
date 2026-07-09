@@ -104,6 +104,15 @@ def get_combined_args(parser : ArgumentParser):
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)
 
+    # VAR edit
+    # fine model path with model_outputs dir and scene name
+    if getattr(args_cmdline, "model_path", None) is None:
+        model_dir = getattr(args_cmdline, "model_dir", None)
+        scene = getattr(args_cmdline, "scene_name", None)
+
+        if model_dir is not None and scene is not None:
+            args_cmdline.model_path = os.path.join(model_dir, scene)
+
     try:
         cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
         print("Looking for config file in", cfgfilepath)
