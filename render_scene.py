@@ -114,6 +114,9 @@ if __name__ == "__main__":
     args = get_combined_args(parser)
 
     safe_state(args.quiet)
+
+    os.makedirs(args.image_dir, exist_ok=True)
+
     render_scene(
         model.extract(args),
         pipeline.extract(args),
