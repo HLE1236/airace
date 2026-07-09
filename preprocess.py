@@ -132,7 +132,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output",
         type=Path,
-        default="/kaggle/working/cleaned_input"
+        default="/kaggle/working/cleaned_inputs"
     )
 
     args = parser.parse_args()
