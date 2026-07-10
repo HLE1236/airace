@@ -106,7 +106,7 @@ if __name__ == "__main__":
     pipeline = PipelineParams(parser)
     parser.add_argument("--model_dir", default="/kaggle/working/model_outputs")
     parser.add_argument("--input_dir", default="/kaggle/working/cleaned_inputs")
-    parser.add_argument("--iteration", default=-1, type=int)
+    parser.add_argument("--iterations", default=-1, type=int)
     parser.add_argument("--image_dir", default="/kaggle/working/image_outputs")
     parser.add_argument("--scene_name", required=True)
     parser.add_argument("--quiet", action="store_true")
@@ -123,5 +123,5 @@ if __name__ == "__main__":
         args.input_dir,
         args.image_dir,
         args.scene_name,
-        args.iteration,
+        args.iterations,
     )

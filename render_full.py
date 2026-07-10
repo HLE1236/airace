@@ -51,7 +51,7 @@ if __name__ == "__main__":
             "--input_dir", args.input_dir,
             "--image_dir", args.image_dir,
             "--scene_name", scene,
-            "--iteration", str(args.iteration),
+            "--iterations", str(args.iterations),
         ]
         if args.quiet:
             cmd.append("--quiet")
