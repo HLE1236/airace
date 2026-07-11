@@ -12,7 +12,7 @@ from tqdm import tqdm
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel, render
 from scene.cameras import Camera
-from scene.colmap_loader import qvec2rotmat, read_cameras_binary
+from scene.colmap_loader import qvec2rotmat, read_intrinsics_binary
 from utils.graphics_utils import focal2fov
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import safe_state
@@ -76,7 +76,7 @@ def load_gaussians(dataset, iteration):
 def load_distortion_params(orig_dir, scene_name):
     """Đọc camera SIMPLE_RADIAL gốc (chưa undistort) từ orig_dir"""
     cameras_bin = Path(orig_dir) / scene_name / "train" / "sparse" / "0" / "cameras.bin"
-    cams = read_cameras_binary(str(cameras_bin))
+    cams = read_intrinsics_binary(str(cameras_bin))
     assert len(cams) == 1, f"Expect exactly 1 camera, got {len(cams)}"
     cam = next(iter(cams.values()))
     assert cam.model == "SIMPLE_RADIAL", f"Unsupported model: {cam.model}"
