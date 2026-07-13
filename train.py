@@ -58,15 +58,20 @@ except:
 # test evaluation
 def load_gt_image(gt_dir, image_name, device):
     """
-    GT nam trong test/images/, cung TEN GOC nhung duoi la .jpg (khac voi
-    duoi trong test_poses.csv). Khop theo STEM, khong khop nguyen ten file.
+    GT nam trong test/images/, cung TEN GOC nhung duoi co the khac
+    (vd .JPG thay vi .jpg trong CSV). Khop theo STEM, thu nhieu bien
+    the duoi file khong phan biet hoa/thuong.
     """
     stem = Path(image_name).stem
-    gt_path = Path(gt_dir) / f"{stem}.jpg"
-    if not gt_path.exists():
-        return None
-    img = Image.open(gt_path).convert("RGB")
-    return to_tensor(img).to(device)
+    gt_dir = Path(gt_dir)
+
+    for ext in (".jpg", ".JPG", ".jpeg", ".JPEG", ".png", ".PNG"):
+        gt_path = gt_dir / f"{stem}{ext}"
+        if gt_path.exists():
+            img = Image.open(gt_path).convert("RGB")
+            return to_tensor(img).to(device)
+
+    return None
 
 
 def render_test_samples(dataset, gaussians, pipe, background, iteration,
