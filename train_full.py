@@ -19,7 +19,12 @@ if __name__ == "__main__":
     parser.add_argument("--subset", nargs="+", default=[])
     parser.add_argument("--cap_max", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--density_control", choices=("3dgs", "improvedgs"), default="3dgs")
+    parser.add_argument(
+        "--density_control",
+        choices=("3dgs", "pixelgs", "improvedgs"),
+        default="3dgs",
+    )
+    parser.add_argument("--pixelgs_depth_threshold", type=float, default=0.37)
     parser.add_argument("--gaussian_budget", type=int, default=1_500_000)
     parser.add_argument("--use_las", type=int, choices=(0, 1), default=1)
     parser.add_argument("--use_rap", type=int, choices=(0, 1), default=1)
@@ -84,7 +89,11 @@ if __name__ == "__main__":
             "--density_control", args.density_control,
         ]
 
-        if args.density_control == "improvedgs":
+        if args.density_control == "pixelgs":
+            cmd.extend([
+                "--pixelgs_depth_threshold", str(args.pixelgs_depth_threshold),
+            ])
+        elif args.density_control == "improvedgs":
             cmd.extend([
                 "--gaussian_budget", str(args.gaussian_budget),
                 "--use_las", str(args.use_las),

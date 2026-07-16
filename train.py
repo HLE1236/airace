@@ -11,11 +11,13 @@
 
 import os
 import json
+import math
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import (
     IMPROVED_GS_RASTERIZER_AVAILABLE,
+    PIXEL_GS_RASTERIZER_AVAILABLE,
     network_gui,
     render,
 )
@@ -88,12 +90,20 @@ _IMPROVEDGS_CONFIG_KEYS = (
     "densification_interval", "opacity_reset_interval",
 )
 
+_PIXELGS_CONFIG_KEYS = (
+    "density_control", "pixelgs_depth_threshold", "densify_grad_threshold",
+    "percent_dense", "densify_from_iter", "densify_until_iter",
+    "densification_interval", "opacity_reset_interval",
+)
+
 
 def _validate_density_control_options(opt):
-    """Validate ImprovedGS arguments without changing the 3DGS defaults."""
+    """Validate density-control arguments without changing 3DGS defaults."""
     density_control = str(opt.density_control).lower()
-    if density_control not in ("3dgs", "improvedgs"):
-        raise ValueError("density_control must be either '3dgs' or 'improvedgs'")
+    if density_control not in ("3dgs", "pixelgs", "improvedgs"):
+        raise ValueError(
+            "density_control must be one of '3dgs', 'pixelgs', or 'improvedgs'"
+        )
     opt.density_control = density_control
 
     component_names = ("use_las", "use_rap", "use_gc", "use_absgrad", "use_eas", "use_mu")
@@ -102,9 +112,25 @@ def _validate_density_control_options(opt):
         if value not in (0, 1, False, True):
             raise ValueError("{} must be 0 or 1".format(name))
 
+    if density_control == "pixelgs":
+        pixelgs_depth_threshold = float(opt.pixelgs_depth_threshold)
+        if (
+            pixelgs_depth_threshold != pixelgs_depth_threshold
+            or pixelgs_depth_threshold in (float("inf"), float("-inf"))
+            or pixelgs_depth_threshold <= 0.0
+        ):
+            raise ValueError("pixelgs_depth_threshold must be a positive finite value")
+        if int(opt.densification_interval) <= 0 or int(opt.opacity_reset_interval) <= 0:
+            raise ValueError("densification and opacity-reset intervals must be positive")
+        if int(opt.densify_until_iter) <= int(opt.densify_from_iter):
+            raise ValueError("densify_until_iter must be greater than densify_from_iter")
+        if float(opt.densify_grad_threshold) < 0.0:
+            raise ValueError("densify_grad_threshold must be non-negative")
+
     if density_control != "improvedgs":
         # The model uses this flag to allocate an additional AbsGrad buffer.
-        # Components are ignored in 3DGS mode, including that memory allocation.
+        # Improved-GS components are ignored outside Improved-GS mode, including
+        # that additional memory allocation.
         opt.use_absgrad = 0
         return
     if int(opt.gaussian_budget) <= 0:
@@ -159,6 +185,42 @@ def _write_improvedgs_config(dataset, opt, seed):
     path = os.path.join(dataset.model_path, "improvedgs_config.json")
     with open(path, "w", encoding="utf-8") as config_file:
         json.dump(config, config_file, indent=2, sort_keys=True)
+
+
+def _build_pixelgs_config(opt, seed, cap_max):
+    """Return the Pixel-GS settings that must match when training resumes."""
+    config = {key: getattr(opt, key) for key in _PIXELGS_CONFIG_KEYS}
+    config["cap_max"] = int(cap_max)
+    config["seed"] = int(seed)
+    return config
+
+
+def _write_pixelgs_config(dataset, config):
+    """Persist the paper-specific Pixel-GS configuration beside cfg_args."""
+    path = os.path.join(dataset.model_path, "pixelgs_config.json")
+    with open(path, "w", encoding="utf-8") as config_file:
+        json.dump(config, config_file, indent=2, sort_keys=True)
+
+
+def _validate_pixelgs_resume_config(runtime_state, current_config):
+    """Reject checkpoints produced with another density-control configuration."""
+    saved_config = runtime_state.get("resume_config")
+    if runtime_state.get("density_control") != "pixelgs" or saved_config is None:
+        raise ValueError(
+            "Pixel-GS resume requires a checkpoint created with "
+            "--density_control pixelgs by this implementation"
+        )
+    if saved_config != current_config:
+        differing_keys = [
+            key
+            for key in sorted(set(saved_config) | set(current_config))
+            if saved_config.get(key) != current_config.get(key)
+        ]
+        raise ValueError(
+            "Pixel-GS checkpoint configuration mismatch in: {}. Resume with "
+            "the original Pixel-GS threshold, densification settings, cap, and "
+            "seed.".format(", ".join(differing_keys))
+        )
 
 
 def _visibility_as_bool(visibility_filter, num_gaussians, device):
@@ -378,6 +440,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     _validate_density_control_options(opt)
     improved_mode = opt.density_control == "improvedgs"
+    pixelgs_mode = opt.density_control == "pixelgs"
 
     if (
         improved_mode
@@ -387,6 +450,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         raise RuntimeError(
             "AbsGrad/EAS requires the tracked Improved-GS rasterizer patch. "
             "Run `python scripts/apply_improved_gs_rasterizer_patch.py` and "
+            "force-reinstall submodules/diff-gaussian-rasterization."
+        )
+
+    if pixelgs_mode and not PIXEL_GS_RASTERIZER_AVAILABLE:
+        raise RuntimeError(
+            "Pixel-GS requires the tracked rasterizer patch. Run "
+            "`python scripts/apply_improved_gs_rasterizer_patch.py` and "
             "force-reinstall submodules/diff-gaussian-rasterization."
         )
 
@@ -402,9 +472,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     checkpoint_runtime_state = None
     tb_writer = prepare_output_and_logger(dataset)
-    resume_config = (
+    improved_resume_config = (
         build_improvedgs_resume_config(dataset, opt, pipe, seed)
         if improved_mode
+        else None
+    )
+    pixelgs_resume_config = (
+        _build_pixelgs_config(opt, seed, cap_max)
+        if pixelgs_mode
         else None
     )
     if improved_mode:
@@ -426,6 +501,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    pixelgs_absolute_depth_threshold = (
+        float(opt.pixelgs_depth_threshold) * float(scene.cameras_extent)
+        if pixelgs_mode
+        else None
+    )
+    if pixelgs_mode and (
+        not math.isfinite(pixelgs_absolute_depth_threshold)
+        or pixelgs_absolute_depth_threshold <= 0.0
+    ):
+        raise ValueError("Pixel-GS requires a positive scene camera extent")
     gaussians.training_setup(opt)
     if checkpoint:
         checkpoint_payload = torch.load(checkpoint, weights_only=False)
@@ -463,46 +548,51 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     all_train_cameras = scene.getTrainCameras().copy()
     if checkpoint_runtime_state is not None:
-        if not improved_mode:
+        if pixelgs_mode:
+            _validate_pixelgs_resume_config(
+                checkpoint_runtime_state, pixelgs_resume_config
+            )
+        elif not improved_mode:
             raise ValueError(
-                "This checkpoint contains Improved-GS runtime state but the "
-                "current run uses --density_control 3dgs"
+                "This checkpoint contains method-specific runtime state but the "
+                "current run uses --density_control {}".format(opt.density_control)
             )
-        validate_improvedgs_resume_config(
-            checkpoint_runtime_state, resume_config
-        )
-        if checkpoint_runtime_state.get("resume_config") is None:
-            print(
-                "[ImprovedGS] Checkpoint has no saved method configuration; "
-                "the caller is responsible for using the original flags.",
-                flush=True,
+        else:
+            validate_improvedgs_resume_config(
+                checkpoint_runtime_state, improved_resume_config
             )
-        current_cameras_by_name = {
-            camera.image_name: camera for camera in all_train_cameras
-        }
-        if len(current_cameras_by_name) != len(all_train_cameras):
-            raise ValueError("Training camera image names must be unique")
-        saved_camera_order = checkpoint_runtime_state.get("camera_order_names")
-        if saved_camera_order is not None:
-            if (
-                len(saved_camera_order) != len(all_train_cameras)
-                or len(set(saved_camera_order)) != len(saved_camera_order)
-                or set(saved_camera_order) != set(current_cameras_by_name)
+            if checkpoint_runtime_state.get("resume_config") is None:
+                print(
+                    "[ImprovedGS] Checkpoint has no saved method configuration; "
+                    "the caller is responsible for using the original flags.",
+                    flush=True,
+                )
+            current_cameras_by_name = {
+                camera.image_name: camera for camera in all_train_cameras
+            }
+            if len(current_cameras_by_name) != len(all_train_cameras):
+                raise ValueError("Training camera image names must be unique")
+            saved_camera_order = checkpoint_runtime_state.get("camera_order_names")
+            if saved_camera_order is not None:
+                if (
+                    len(saved_camera_order) != len(all_train_cameras)
+                    or len(set(saved_camera_order)) != len(saved_camera_order)
+                    or set(saved_camera_order) != set(current_cameras_by_name)
+                ):
+                    raise ValueError(
+                        "Checkpoint camera set does not match the current scene"
+                    )
+                all_train_cameras = [
+                    current_cameras_by_name[name] for name in saved_camera_order
+                ]
+
+            saved_exposure_mapping = checkpoint_runtime_state.get("exposure_mapping")
+            if saved_exposure_mapping is not None and set(saved_exposure_mapping) != set(
+                current_cameras_by_name
             ):
                 raise ValueError(
-                    "Checkpoint camera set does not match the current scene"
+                    "Checkpoint exposure mapping does not match the current scene"
                 )
-            all_train_cameras = [
-                current_cameras_by_name[name] for name in saved_camera_order
-            ]
-
-        saved_exposure_mapping = checkpoint_runtime_state.get("exposure_mapping")
-        if saved_exposure_mapping is not None and set(saved_exposure_mapping) != set(
-            current_cameras_by_name
-        ):
-            raise ValueError(
-                "Checkpoint exposure mapping does not match the current scene"
-            )
 
     viewpoint_indices = list(range(len(all_train_cameras)))
     viewpoint_stack = all_train_cameras.copy()
@@ -525,7 +615,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
     ) if improved_mode and bool(opt.use_rap) else set()
 
-    if checkpoint_runtime_state is not None:
+    if checkpoint_runtime_state is not None and improved_mode:
         remaining_names = checkpoint_runtime_state.get("remaining_camera_names")
         if remaining_names is not None:
             current_name_to_index = {
@@ -554,6 +644,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_indices = saved_indices
         viewpoint_stack = [all_train_cameras[index] for index in saved_indices]
         restore_improvedgs_runtime_state(gaussians, checkpoint_runtime_state)
+    elif checkpoint and pixelgs_mode and checkpoint_runtime_state is None:
+        raise ValueError(
+            "Cannot verify Pixel-GS settings in this legacy checkpoint. Resume "
+            "from a checkpoint created with --density_control pixelgs by this "
+            "implementation."
+        )
     elif checkpoint and improved_mode:
         interval = mu_update_interval(
             int(first_iter),
@@ -580,6 +676,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # compatibility checks, so a failed resume cannot overwrite the
         # original run configuration.
         _write_improvedgs_config(dataset, opt, seed)
+    elif pixelgs_mode:
+        _write_pixelgs_config(dataset, pixelgs_resume_config)
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
@@ -623,7 +721,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        if improved_mode and bool(opt.use_absgrad):
+        if pixelgs_mode and iteration < int(opt.densify_until_iter):
+            render_pkg = render(
+                viewpoint_cam,
+                gaussians,
+                pipe,
+                bg,
+                use_trained_exp=dataset.train_test_exp,
+                separate_sh=SPARSE_ADAM_AVAILABLE,
+                track_gradients=True,
+                track_pixel_counts=True,
+                pixelgs_depth_threshold=pixelgs_absolute_depth_threshold,
+            )
+        elif improved_mode and bool(opt.use_absgrad):
             try:
                 render_pkg = render(
                     viewpoint_cam, gaussians, pipe, bg,
@@ -809,7 +919,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration < opt.densify_until_iter:
                     # Keep track of max radii in image-space for pruning
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                    if pixelgs_mode:
+                        pixel_counts = render_pkg.get("pixel_counts")
+                        pixelgs_grad_scale = render_pkg.get("pixelgs_grad_scale")
+                        if pixel_counts is None or pixelgs_grad_scale is None:
+                            raise RuntimeError(
+                                "Pixel-GS render must return pixel_counts and "
+                                "pixelgs_grad_scale before densification ends"
+                            )
+                        gaussians.add_densification_stats_pixelgs(
+                            viewspace_point_tensor,
+                            visibility_filter,
+                            pixel_counts,
+                            pixelgs_grad_scale,
+                        )
+                    else:
+                        gaussians.add_densification_stats(
+                            viewspace_point_tensor, visibility_filter
+                        )
 
                     # VAR: add capmax constraint
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
@@ -852,9 +979,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             camera.image_name for camera in all_train_cameras
                         ],
                     )
-                    runtime_state["resume_config"] = resume_config
+                    runtime_state["resume_config"] = improved_resume_config
                     checkpoint_payload = (
                         gaussians.capture(), iteration, runtime_state
+                    )
+                elif pixelgs_mode:
+                    checkpoint_payload = (
+                        gaussians.capture(),
+                        iteration,
+                        {
+                            "density_control": "pixelgs",
+                            "resume_config": pixelgs_resume_config,
+                        },
                     )
                 else:
                     checkpoint_payload = (gaussians.capture(), iteration)
