@@ -6,6 +6,7 @@ from pathlib import Path
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Render all scenes with trained 3DGS")
+    parser.add_argument("--orig_dir", default="/kaggle/input/datasets/xuanph/phase1/phase1/private_set1")
     parser.add_argument("--model_dir", default="/kaggle/working/model_outputs")
     parser.add_argument("--input_dir", default="/kaggle/working/cleaned_inputs")
     parser.add_argument("--image_dir", default="/kaggle/working/image_outputs")
@@ -52,6 +53,7 @@ if __name__ == "__main__":
             "--image_dir", args.image_dir,
             "--scene_name", scene,
             "--iterations", str(args.iterations),
+            "--orig_dir", args.orig_dir,
         ]
         if args.quiet:
             cmd.append("--quiet")

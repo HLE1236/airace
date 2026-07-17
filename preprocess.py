@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import concurrent.futures
 from pathlib import Path
 
 import numpy as np
@@ -121,10 +122,14 @@ def generate_alpha_masks_and_embed_from_original(orig_image_dir, orig_sparse_dir
 
     try:
         image_names = sorted(os.listdir(orig_image_dir))
-        for name in image_names:
+        
+        def create_white_image(name):
             with Image.open(orig_image_dir / name) as im:
                 w, h = im.size
             Image.new("RGB", (w, h), (255, 255, 255)).save(white_dir / name)
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            list(executor.map(create_white_image, image_names))
 
         print(f"Generating alpha masks (COLMAP CLI on white images)...")
         _run_colmap_undistorter(
@@ -133,14 +138,13 @@ def generate_alpha_masks_and_embed_from_original(orig_image_dir, orig_sparse_dir
         )
         mask_src_dir = mask_out_dir / "images"
 
-        embedded = 0
-        for name in os.listdir(mask_src_dir):
+        mask_names = os.listdir(mask_src_dir)
+        def merge_mask(name):
             mask_path = mask_src_dir / name
-            # anh da undistort that co the doi duoi (COLMAP thuong giu nguyen ten/duoi goc)
             undist_img_path = undistorted_image_dir / name
             if not undist_img_path.exists():
                 print(f"  WARNING: khong tim thay anh undistort tuong ung cho mask {name}, bo qua")
-                continue
+                return 0
 
             mask_im = np.array(Image.open(mask_path).convert("L"))
             binary_alpha = (mask_im > threshold).astype(np.uint8) * 255
@@ -152,7 +156,11 @@ def generate_alpha_masks_and_embed_from_original(orig_image_dir, orig_sparse_dir
             Image.fromarray(rgba, mode="RGBA").save(out_path)
             if out_path != undist_img_path:
                 undist_img_path.unlink()  # xoa file .jpg cu neu doi sang .png
-            embedded += 1
+            return 1
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = list(executor.map(merge_mask, mask_names))
+        embedded = sum(results)
 
         print(f"Đã ghi alpha channel vào {embedded} ảnh undistort tại {undistorted_image_dir}")
 

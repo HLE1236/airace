@@ -108,89 +108,84 @@ def load_undistorted_camera_params(input_dir, scene_name):
                 width=cam.width, height=cam.height)
 
 
-def redistort_image(img, f, cx, cy, k, num_iters=15):
-    """img: tensor [C,H,W] (anh render "undistorted", canvas mo rong) -> anh da meo theo k.
+_redistort_cache = {}
 
-    Giai nguoc r_d = r_u + k*r_u^3 bang Newton's method tren ban kinh (giong het
-    experiment_distort.py) -- on dinh hon fixed-point iteration cu tren x,y rieng le,
-    dac biet o vung ria canvas mo rong hoac khi k lon.
+def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w, orig_h, num_iters=15):
+    """
+    img: tensor [C,H,W] la anh render tren canvas "undistorted" da mo rong.
+    Kich thuoc (H,W) va tam quang hoc (cx_render,cy_render) phai KHOP voi camera PINHOLE render.
+    cx_orig, cy_orig, orig_w, orig_h: intrinsics + kich thuoc anh GOC/GT (distorted), dung de crop.
+    
+    Ban toi uu: Cache lai grid mapping r_d = r_u + k*r_u^3 va cac toa do crop vi
+    chung hoan toan GIONG NHAU cho tat ca cac frame cua cung mot camera model trong cung 1 scene.
     """
     C, H, W = img.shape
     device = img.device
 
-    ys, xs = torch.meshgrid(
-        torch.arange(H, device=device, dtype=torch.float32),
-        torch.arange(W, device=device, dtype=torch.float32),
-        indexing="ij",
-    )
-    xd = (xs - cx) / f
-    yd = (ys - cy) / f
-    rd = torch.sqrt(xd * xd + yd * yd)
+    cache_key = (H, W, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w, orig_h, str(device), num_iters)
 
-    ru = rd.clone()
-    for _ in range(num_iters):
-        g = k * ru**3 + ru - rd
-        g_prime = 3 * k * ru**2 + 1
-        g_prime = torch.where(g_prime.abs() < 1e-12, torch.full_like(g_prime, 1e-12), g_prime)
-        ru = ru - g / g_prime
-
-    scale = torch.where(rd > 1e-12, ru / rd, torch.ones_like(rd))
-
-    xu = xd * scale
-    yu = yd * scale
-
-    u_src = xu * f + cx
-    v_src = yu * f + cy
-
-    grid_x = (u_src / (W - 1)) * 2 - 1
-    grid_y = (v_src / (H - 1)) * 2 - 1
-    grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-
-    out = F.grid_sample(
-        img.unsqueeze(0), grid, mode="bilinear",
-        padding_mode="zeros", align_corners=True,
-    )
-    return out.squeeze(0)
-
-
-def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w, orig_h, num_iters=15):
-    """
-    img: tensor [C,H,W] la anh render tren canvas "undistorted" da mo rong -- kich thuoc
-         (H,W) va tam quang hoc (cx_render,cy_render) phai KHOP voi camera PINHOLE that su
-         dung de render (doc tu load_undistorted_camera_params), khong duoc gia dinh la
-         W/2,H/2 vi COLMAP undistort co the khong dat tam dung giua canvas mo rong.
-    cx_orig, cy_orig, orig_w, orig_h: intrinsics + kich thuoc anh GOC/GT (distorted, tu
-         cameras.bin SIMPLE_RADIAL truoc undistort), dung de crop lai dung khung nhu GT.
-
-    Tra ve: anh da redistort VA da crop ve dung (orig_h, orig_w), giong pattern trong
-    experiment_distort.py (undistort -> redistort_full -> crop bang offset giua 2 tam).
-    """
-    distorted_full = redistort_image(img, f=f, cx=cx_render, cy=cy_render, k=k, num_iters=num_iters)
-
-    _, H, W = distorted_full.shape
-    offset_x = int(round(cx_render - cx_orig))
-    offset_y = int(round(cy_render - cy_orig))
-
-    x0 = max(offset_x, 0)
-    y0 = max(offset_y, 0)
-    x1 = min(offset_x + orig_w, W)
-    y1 = min(offset_y + orig_h, H)
-
-    if x0 >= x1 or y0 >= y1:
-        raise ValueError(
-            f"Crop window rong/vuot canvas: offset=({offset_x},{offset_y}) "
-            f"canvas=({W}x{H}) target=({orig_w}x{orig_h})"
+    if cache_key not in _redistort_cache:
+        # 1. Giai nguoc r_d = r_u + k*r_u^3 bang Newton's method
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing="ij",
         )
+        xd = (xs - cx_render) / f
+        yd = (ys - cy_render) / f
+        rd = torch.sqrt(xd * xd + yd * yd)
 
-    cropped = distorted_full[:, y0:y1, x0:x1]
+        ru = rd.clone()
+        for _ in range(num_iters):
+            g = k * ru**3 + ru - rd
+            g_prime = 3 * k * ru**2 + 1
+            g_prime = torch.where(g_prime.abs() < 1e-12, torch.full_like(g_prime, 1e-12), g_prime)
+            ru = ru - g / g_prime
 
-    # Neu offset am hoac canvas render nho hon target (khong nen xay ra neu undistort
-    # dung max_scale du lon), pad zero cho khop kich thuoc goc thay vi silently resize.
-    if cropped.shape[1] != orig_h or cropped.shape[2] != orig_w:
+        scale = torch.where(rd > 1e-12, ru / rd, torch.ones_like(rd))
+        xu = xd * scale
+        yu = yd * scale
+
+        u_src = xu * f + cx_render
+        v_src = yu * f + cy_render
+
+        grid_x = (u_src / (W - 1)) * 2 - 1
+        grid_y = (v_src / (H - 1)) * 2 - 1
+        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+
+        # 2. Tinh toan cac toa do crop
+        offset_x = int(round(cx_render - cx_orig))
+        offset_y = int(round(cy_render - cy_orig))
+
+        x0 = max(offset_x, 0)
+        y0 = max(offset_y, 0)
+        x1 = min(offset_x + orig_w, W)
+        y1 = min(offset_y + orig_h, H)
+
+        if x0 >= x1 or y0 >= y1:
+            raise ValueError(
+                f"Crop window rong/vuot canvas: offset=({offset_x},{offset_y}) "
+                f"canvas=({W}x{H}) target=({orig_w}x{orig_h})"
+            )
+
         pad_top = y0 - offset_y
         pad_left = x0 - offset_x
-        pad_bottom = orig_h - cropped.shape[1] - pad_top
-        pad_right = orig_w - cropped.shape[2] - pad_left
+        pad_bottom = orig_h - (y1 - y0) - pad_top
+        pad_right = orig_w - (x1 - x0) - pad_left
+
+        _redistort_cache[cache_key] = (grid, x0, y0, x1, y1, pad_left, pad_right, pad_top, pad_bottom)
+
+    # 3. Su dung thong so da cache de mapping anh hien tai
+    grid, x0, y0, x1, y1, pad_left, pad_right, pad_top, pad_bottom = _redistort_cache[cache_key]
+
+    out = F.grid_sample(
+        img.unsqueeze(0), grid, mode="bicubic",
+        padding_mode="zeros", align_corners=True,
+    ).squeeze(0)
+
+    cropped = out[:, y0:y1, x0:x1]
+
+    if pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0:
         cropped = F.pad(
             cropped, (pad_left, pad_right, pad_top, pad_bottom),
             mode="constant", value=0,
@@ -198,7 +193,7 @@ def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w
 
     return cropped
 
-def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration, orig_dir):
+def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration, orig_dir, supersample_factor=1.0):
     gaussians, loaded_iter = load_gaussians(dataset, iteration)
     scene_dir = Path(output_dir) / scene_name
     test_poses_csv = Path(input_dir) / scene_name / "test" / "test_poses.csv" 
@@ -261,8 +256,10 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
         for idx, row in enumerate(tqdm(rows, desc=f"Rendering {scene_name}")):
             camera = camera_from_csv_row(
                 row, idx, dataset.data_device,
-                width=und["width"], height=und["height"],
-                fx=und["f"], fy=und["f"],
+                width=int(und["width"] * supersample_factor), 
+                height=int(und["height"] * supersample_factor),
+                fx=und["f"] * supersample_factor, 
+                fy=und["f"] * supersample_factor,
             )
             rendering = render(
                 camera,
@@ -302,15 +299,24 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
                 # rendering_before = rendering.clone()
                 rendering = redistort_and_crop(
                     rendering,
-                    f=und["f"],
-                    cx_render=und["cx"],
-                    cy_render=und["cy"],
+                    f=und["f"] * supersample_factor,
+                    cx_render=und["cx"] * supersample_factor,
+                    cy_render=und["cy"] * supersample_factor,
                     k=dist["k"],
-                    cx_orig=dist["cx"],
-                    cy_orig=dist["cy"],
-                    orig_w=dist["width"],
-                    orig_h=dist["height"],
+                    cx_orig=dist["cx"] * supersample_factor,
+                    cy_orig=dist["cy"] * supersample_factor,
+                    orig_w=int(dist["width"] * supersample_factor),
+                    orig_h=int(dist["height"] * supersample_factor),
                 )
+
+            if supersample_factor != 1.0:
+                target_h = int(round(rendering.shape[1] / supersample_factor))
+                target_w = int(round(rendering.shape[2] / supersample_factor))
+                rendering = F.interpolate(
+                    rendering.unsqueeze(0), 
+                    size=(target_h, target_w), 
+                    mode="area"
+                ).squeeze(0)
                 # # THEMMM
                 # if idx == 0:
                 #     # crop rendering_before ve cung kich thuoc de so sanh cho cong bang
@@ -339,6 +345,7 @@ if __name__ == "__main__":
     parser.add_argument("--image_dir", default="/kaggle/working/image_outputs")
     parser.add_argument("--scene_name", required=True)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--supersample_factor", default=1.0, type=float, help="Scale factor for supersampling (e.g. 2.0)")
 
     args = get_combined_args(parser)
 
@@ -353,5 +360,6 @@ if __name__ == "__main__":
         args.image_dir,
         args.scene_name,
         args.iterations,
-        args.orig_dir
+        args.orig_dir,
+        supersample_factor=args.supersample_factor
     )
