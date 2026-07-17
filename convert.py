@@ -21,6 +21,7 @@ parser.add_argument("--skip_matching", action='store_true')
 parser.add_argument("--source_path", "-s", required=True, type=str)
 parser.add_argument("--camera", default="OPENCV", type=str)
 parser.add_argument("--colmap_executable", default="", type=str)
+parser.add_argument("--matcher", default="exhaustive", choices=["exhaustive", "sequential", "spatial"], help="COLMAP matching strategy")
 parser.add_argument("--resize", action="store_true")
 parser.add_argument("--magick_executable", default="", type=str)
 args = parser.parse_args()
@@ -37,16 +38,18 @@ if not args.skip_matching:
         --image_path " + args.source_path + "/input \
         --ImageReader.single_camera 1 \
         --ImageReader.camera_model " + args.camera + " \
-        --SiftExtraction.use_gpu " + str(use_gpu)
+        --SiftExtraction.use_gpu " + str(use_gpu) + " \
+        --SiftExtraction.estimate_affine_shape 1 \
+        --SiftExtraction.domain_size_pooling 1"
     exit_code = os.system(feat_extracton_cmd)
     if exit_code != 0:
         logging.error(f"Feature extraction failed with code {exit_code}. Exiting.")
         exit(exit_code)
 
     ## Feature matching
-    feat_matching_cmd = colmap_command + " exhaustive_matcher \
-        --database_path " + args.source_path + "/distorted/database.db \
-        --SiftMatching.use_gpu " + str(use_gpu)
+    feat_matching_cmd = colmap_command + f" {args.matcher}_matcher \\\n" + \
+        f"        --database_path {args.source_path}/distorted/database.db \\\n" + \
+        f"        --SiftMatching.use_gpu {str(use_gpu)}"
     exit_code = os.system(feat_matching_cmd)
     if exit_code != 0:
         logging.error(f"Feature matching failed with code {exit_code}. Exiting.")

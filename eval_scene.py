@@ -2,7 +2,7 @@ import os
 import json
 from pathlib import Path
 from argparse import ArgumentParser
-import lpips
+
 
 import torch
 import torchvision.transforms.functional as tf
@@ -31,25 +31,25 @@ def eval_scene(gt_path, sample_path):
     gt_files = sorted(os.listdir(gt_path))
     sample_files = sorted(os.listdir(sample_path))
 
-    if len(gt_files) != len(sample_files):
-        print(f"!!! Warning: số lượng ảnh lệch nhau: gt={len(gt_files)}, sample={len(sample_files)}")
+    gt_map = {Path(f).stem: f for f in gt_files if not f.startswith('.')}
+    sample_map = {Path(f).stem: f for f in sample_files if not f.startswith('.')}
 
-    common = sorted(set(gt_files) & set(sample_files))
-    if len(common) == 0:
+    common_stems = sorted(set(gt_map.keys()) & set(sample_map.keys()))
+    if len(common_stems) == 0:
         raise RuntimeError(f"Không có file khớp tên giữa {gt_path} và {sample_path}")
 
     ssims, psnrs, lpipss = [], [], []
 
-    for fname in tqdm(common, desc="Evaluating"):
-        gt_img = read_image(gt_path / fname)
-        sample_img = read_image(sample_path / fname)
+    for stem in tqdm(common_stems, desc="Evaluating"):
+        gt_img = read_image(gt_path / gt_map[stem])
+        sample_img = read_image(sample_path / sample_map[stem])
 
         ssims.append(ssim(sample_img, gt_img).item())
         psnrs.append(psnr(sample_img, gt_img).item())
         lpipss.append(lpips(sample_img, gt_img, net_type='alex').item())
 
     return {
-        "num_images": len(common),
+        "num_images": len(common_stems),
         "SSIM": sum(ssims) / len(ssims),
         "PSNR": sum(psnrs) / len(psnrs),
         "LPIPS": sum(lpipss) / len(lpipss),
