@@ -17,6 +17,7 @@ if __name__ == "__main__":
     parser.add_argument("--extra_args", nargs="*", default=[])
     
     # Advanced rendering options
+    parser.add_argument("--supersample_factor", default=1.0, type=float, help="Scale factor for supersampling")
     parser.add_argument("--ensemble_iters", default="", type=str, help="Comma-separated iterations to average (e.g. 29000,30000)")
     parser.add_argument("--jitter_samples", default=1, type=int, help="Number of sub-pixel jitter samples for SSAA")
     parser.add_argument("--use_exposure", action="store_true", help="Apply exposure compensation from exposure.json")
@@ -65,6 +66,8 @@ if __name__ == "__main__":
         ]
         if args.quiet:
             cmd.append("--quiet")
+        if args.supersample_factor != 1.0:
+            cmd.extend(["--supersample_factor", str(args.supersample_factor)])
         if args.ensemble_iters:
             cmd.extend(["--ensemble_iters", args.ensemble_iters])
         if args.jitter_samples > 1:
