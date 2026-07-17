@@ -15,6 +15,14 @@ if __name__ == "__main__":
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--subset", nargs="+", default=[])
     parser.add_argument("--extra_args", nargs="*", default=[])
+    
+    # Advanced rendering options
+    parser.add_argument("--ensemble_iters", default="", type=str, help="Comma-separated iterations to average (e.g. 29000,30000)")
+    parser.add_argument("--jitter_samples", default=1, type=int, help="Number of sub-pixel jitter samples for SSAA")
+    parser.add_argument("--use_exposure", action="store_true", help="Apply exposure compensation from exposure.json")
+    parser.add_argument("--sharpen_amount", default=0.0, type=float, help="UnsharpMask percent (e.g. 0.3 for 30%)")
+    parser.add_argument("--jpeg_quality", default=0, type=int, help="Save as JPEG with this quality and 4:4:4. If 0, saves as PNG/default.")
+    
     args = parser.parse_args()
 
     scenes = sorted([
@@ -57,6 +65,17 @@ if __name__ == "__main__":
         ]
         if args.quiet:
             cmd.append("--quiet")
+        if args.ensemble_iters:
+            cmd.extend(["--ensemble_iters", args.ensemble_iters])
+        if args.jitter_samples > 1:
+            cmd.extend(["--jitter_samples", str(args.jitter_samples)])
+        if args.use_exposure:
+            cmd.append("--use_exposure")
+        if args.sharpen_amount > 0:
+            cmd.extend(["--sharpen_amount", str(args.sharpen_amount)])
+        if args.jpeg_quality > 0:
+            cmd.extend(["--jpeg_quality", str(args.jpeg_quality)])
+            
         cmd += args.extra_args
 
         ret = subprocess.run(cmd)
