@@ -21,6 +21,12 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.mcmc_utils import (
+    MCMC_RELOCATION_N_MAX,
+    compute_mcmc_growth_target,
+    compute_relocation_cuda,
+    mcmc_noise_gate,
+)
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -47,9 +53,12 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree, optimizer_type="default", mcmc_init_mode="legacy"):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
+        self.mcmc_init_mode = str(mcmc_init_mode).lower()
+        if self.mcmc_init_mode not in ("paper", "legacy"):
+            raise ValueError("mcmc_init_mode must be 'paper' or 'legacy'")
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
@@ -177,6 +186,21 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+    def _initial_scale_and_opacity(self, dist2):
+        """Return activated initialization parameters for the selected mode."""
+        if self.mcmc_init_mode == "paper":
+            scale_multiplier = 0.1
+            initial_opacity = 0.5
+        else:
+            scale_multiplier = 1.0
+            initial_opacity = 0.1
+        scales = torch.log(torch.sqrt(dist2) * scale_multiplier)[..., None].repeat(1, 3)
+        opacities = self.inverse_opacity_activation(
+            initial_opacity
+            * torch.ones((dist2.shape[0], 1), dtype=dist2.dtype, device=dist2.device)
+        )
+        return scales, opacities
+
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -188,11 +212,9 @@ class GaussianModel:
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        scales, opacities = self._initial_scale_and_opacity(dist2)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
-
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -518,6 +540,366 @@ class GaussianModel:
             self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device=device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=device)
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=device)
+
+    def _reset_mcmc_optimizer_moments(self, indices):
+        """Clear stale Adam moments for Gaussians changed by an MCMC move."""
+        indices = torch.as_tensor(
+            indices, device=self.get_xyz.device, dtype=torch.long
+        ).reshape(-1)
+        if indices.numel() == 0 or self.optimizer is None:
+            return
+        indices = torch.unique(indices)
+        for group in self.optimizer.param_groups:
+            if len(group["params"]) != 1:
+                raise RuntimeError("Each Gaussian optimizer group must own one tensor")
+            parameter = group["params"][0]
+            state = self.optimizer.state.get(parameter)
+            if state is None:
+                continue
+            for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                value = state.get(key)
+                if (
+                    torch.is_tensor(value)
+                    and value.ndim > 0
+                    and value.shape[0] == parameter.shape[0]
+                ):
+                    value[indices] = 0
+
+    def _rebind_mcmc_parameters(self, reset_indices):
+        """Rebind every Gaussian Parameter after an in-place relocation.
+
+        This mirrors the reference implementation: gradients produced at the
+        pre-relocation positions are discarded, optimizer state is transferred,
+        and only donor moments are reset.
+        """
+        tensors = {
+            "xyz": self._xyz,
+            "f_dc": self._features_dc,
+            "f_rest": self._features_rest,
+            "opacity": self._opacity,
+            "scaling": self._scaling,
+            "rotation": self._rotation,
+        }
+        reset_indices = torch.as_tensor(
+            reset_indices, device=self.get_xyz.device, dtype=torch.long
+        ).reshape(-1)
+        reset_indices = torch.unique(reset_indices)
+        rebound = {}
+        for group in self.optimizer.param_groups:
+            if len(group["params"]) != 1 or group["name"] not in tensors:
+                raise RuntimeError("Unexpected Gaussian optimizer parameter group")
+            old_parameter = group["params"][0]
+            stored_state = self.optimizer.state.get(old_parameter)
+            if stored_state is not None:
+                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    value = stored_state.get(key)
+                    if (
+                        torch.is_tensor(value)
+                        and value.ndim > 0
+                        and value.shape[0] == old_parameter.shape[0]
+                    ):
+                        value[reset_indices] = 0
+                del self.optimizer.state[old_parameter]
+            new_parameter = nn.Parameter(tensors[group["name"]].detach().requires_grad_(True))
+            group["params"][0] = new_parameter
+            if stored_state is not None:
+                self.optimizer.state[new_parameter] = stored_state
+            rebound[group["name"]] = new_parameter
+
+        self._xyz = rebound["xyz"]
+        self._features_dc = rebound["f_dc"]
+        self._features_rest = rebound["f_rest"]
+        self._opacity = rebound["opacity"]
+        self._scaling = rebound["scaling"]
+        self._rotation = rebound["rotation"]
+
+    def _sample_mcmc_donors(
+        self, probabilities, num_samples, candidate_indices=None, generator=None
+    ):
+        """Sample donor indices and return their global clone multiplicities."""
+        if isinstance(num_samples, bool) or not isinstance(num_samples, int):
+            raise TypeError("num_samples must be an integer")
+        if num_samples < 0:
+            raise ValueError("num_samples must be non-negative")
+        point_count = int(self.get_xyz.shape[0])
+        probabilities = torch.as_tensor(
+            probabilities, device=self.get_xyz.device, dtype=self.get_opacity.dtype
+        ).detach().reshape(-1)
+        if candidate_indices is None:
+            candidate_indices = torch.arange(
+                point_count, device=self.get_xyz.device, dtype=torch.long
+            )
+        else:
+            candidate_indices = torch.as_tensor(
+                candidate_indices, device=self.get_xyz.device, dtype=torch.long
+            ).reshape(-1)
+        if probabilities.numel() != candidate_indices.numel():
+            raise ValueError("probabilities must match candidate_indices")
+        if num_samples == 0:
+            return candidate_indices.new_empty((0,)), torch.zeros(
+                point_count, dtype=torch.long, device=self.get_xyz.device
+            )
+        if candidate_indices.numel() == 0:
+            raise ValueError("cannot sample an empty donor set")
+        if not torch.isfinite(probabilities).all() or torch.any(probabilities < 0):
+            raise ValueError("donor probabilities must be finite and non-negative")
+        probability_sum = probabilities.sum()
+        if float(probability_sum) <= torch.finfo(probabilities.dtype).eps:
+            probabilities = torch.ones_like(probabilities)
+            probability_sum = probabilities.sum()
+        local_indices = torch.multinomial(
+            probabilities / probability_sum,
+            num_samples,
+            replacement=True,
+            generator=generator,
+        )
+        sampled_indices = candidate_indices[local_indices]
+        multiplicity = torch.bincount(
+            sampled_indices, minlength=point_count
+        ).to(dtype=torch.long)
+        return sampled_indices, multiplicity
+
+    def _mcmc_relocated_parameters(
+        self,
+        donor_indices,
+        multiplicity,
+        min_opacity=0.005,
+        relocation_fn=None,
+        n_max=MCMC_RELOCATION_N_MAX,
+    ):
+        donor_indices = torch.as_tensor(
+            donor_indices, device=self.get_xyz.device, dtype=torch.long
+        ).reshape(-1)
+        multiplicity = torch.as_tensor(
+            multiplicity, device=self.get_xyz.device, dtype=torch.long
+        ).reshape(-1)
+        if multiplicity.numel() != self.get_xyz.shape[0]:
+            raise ValueError("multiplicity must contain one value per Gaussian")
+        if donor_indices.numel() == 0:
+            raise ValueError("at least one donor index is required")
+        if relocation_fn is None:
+            relocation_fn = compute_relocation_cuda
+        donor_multiplicity = (multiplicity[donor_indices] + 1).clamp_(
+            min=1, max=n_max - 1
+        )
+        # sigmoid(float32) can round a large finite logit to exactly one. The
+        # relocation limit is well-defined, but the float32 alternating sum in
+        # the CUDA kernel becomes ill-conditioned at that endpoint for large
+        # multiplicities. Use the nearest representable probability below one.
+        donor_opacity = self.get_opacity[donor_indices, 0].clamp(
+            max=1.0 - torch.finfo(self.get_opacity.dtype).eps
+        )
+        new_opacity, new_scaling = relocation_fn(
+            donor_opacity,
+            self.get_scaling[donor_indices],
+            donor_multiplicity,
+            n_max=n_max,
+        )
+        new_opacity = torch.as_tensor(
+            new_opacity, device=self.get_xyz.device, dtype=self._opacity.dtype
+        ).reshape(-1)
+        new_scaling = torch.as_tensor(
+            new_scaling, device=self.get_xyz.device, dtype=self._scaling.dtype
+        ).reshape(-1, 3)
+        epsilon = torch.finfo(new_opacity.dtype).eps
+        new_opacity = new_opacity.clamp(min=float(min_opacity), max=1.0 - epsilon)
+        new_scaling = new_scaling.clamp_min(torch.finfo(new_scaling.dtype).tiny)
+        return (
+            self._xyz[donor_indices].clone(),
+            self._features_dc[donor_indices].clone(),
+            self._features_rest[donor_indices].clone(),
+            self.inverse_opacity_activation(new_opacity).unsqueeze(-1),
+            self.scaling_inverse_activation(new_scaling),
+            self._rotation[donor_indices].clone(),
+        )
+
+    @torch.no_grad()
+    def relocate_mcmc(
+        self,
+        dead_mask,
+        min_opacity=0.005,
+        relocation_fn=None,
+        generator=None,
+        n_max=MCMC_RELOCATION_N_MAX,
+    ):
+        """Teleport low-opacity Gaussians to opacity-weighted live donors."""
+        point_count = int(self.get_xyz.shape[0])
+        dead_mask = torch.as_tensor(
+            dead_mask, device=self.get_xyz.device, dtype=torch.bool
+        ).reshape(-1)
+        if dead_mask.numel() != point_count:
+            raise ValueError("dead_mask must contain one value per Gaussian")
+        dead_indices = dead_mask.nonzero(as_tuple=False).reshape(-1)
+        if dead_indices.numel() == 0:
+            return 0
+        alive_indices = (~dead_mask).nonzero(as_tuple=False).reshape(-1)
+        if alive_indices.numel() == 0:
+            return 0
+        sampled_indices, multiplicity = self._sample_mcmc_donors(
+            self.get_opacity[alive_indices, 0],
+            int(dead_indices.numel()),
+            candidate_indices=alive_indices,
+            generator=generator,
+        )
+        relocated = self._mcmc_relocated_parameters(
+            sampled_indices,
+            multiplicity,
+            min_opacity=min_opacity,
+            relocation_fn=relocation_fn,
+            n_max=n_max,
+        )
+        (
+            self._xyz[dead_indices],
+            self._features_dc[dead_indices],
+            self._features_rest[dead_indices],
+            self._opacity[dead_indices],
+            self._scaling[dead_indices],
+            self._rotation[dead_indices],
+        ) = relocated
+        # A donor and all copies produced from it use the same analytically
+        # adjusted opacity and scale, preserving its rendered contribution.
+        self._opacity[sampled_indices] = relocated[3]
+        self._scaling[sampled_indices] = relocated[4]
+        # Rebinding clears every stale pre-relocation gradient. Following the
+        # official code, Adam moments are reset for sampled donors; relocated
+        # slots retain their history but cannot receive the old gradient.
+        self._rebind_mcmc_parameters(sampled_indices)
+        return int(dead_indices.numel())
+
+    @torch.no_grad()
+    def grow_mcmc(
+        self,
+        cap_max,
+        growth_rate=1.05,
+        min_opacity=0.005,
+        relocation_fn=None,
+        generator=None,
+        n_max=MCMC_RELOCATION_N_MAX,
+    ):
+        """Add at most one MCMC growth step without exceeding ``cap_max``."""
+        current_count = int(self.get_xyz.shape[0])
+        target_count = compute_mcmc_growth_target(
+            current_count, int(cap_max), growth_rate
+        )
+        add_count = max(target_count - current_count, 0)
+        if add_count == 0:
+            return 0
+        sampled_indices, multiplicity = self._sample_mcmc_donors(
+            self.get_opacity[:, 0], add_count, generator=generator
+        )
+        new_parameters = self._mcmc_relocated_parameters(
+            sampled_indices,
+            multiplicity,
+            min_opacity=min_opacity,
+            relocation_fn=relocation_fn,
+            n_max=n_max,
+        )
+        self._opacity[sampled_indices] = new_parameters[3]
+        self._scaling[sampled_indices] = new_parameters[4]
+        self.densification_postfix(*new_parameters, new_tmp_radii=None)
+        self._reset_mcmc_optimizer_moments(sampled_indices)
+        return int(add_count)
+
+    @torch.no_grad()
+    def mcmc_relocate_and_grow(
+        self,
+        cap_max,
+        min_opacity=0.005,
+        growth_rate=1.05,
+        relocation_fn=None,
+        generator=None,
+        n_max=MCMC_RELOCATION_N_MAX,
+    ):
+        """Run one coupled dead-sample relocation and capped growth event."""
+        before = int(self.get_xyz.shape[0])
+        dead_mask = (self.get_opacity <= float(min_opacity)).squeeze(-1)
+        relocated = self.relocate_mcmc(
+            dead_mask,
+            min_opacity=min_opacity,
+            relocation_fn=relocation_fn,
+            generator=generator,
+            n_max=n_max,
+        )
+        added = self.grow_mcmc(
+            cap_max,
+            growth_rate=growth_rate,
+            min_opacity=min_opacity,
+            relocation_fn=relocation_fn,
+            generator=generator,
+            n_max=n_max,
+        )
+        return {
+            "before": before,
+            "relocated": int(relocated),
+            "added": int(added),
+            "after": int(self.get_xyz.shape[0]),
+            "cap_max": int(cap_max),
+        }
+
+    @staticmethod
+    def _mcmc_covariance_from_scale_rotation(scaling, rotation):
+        """Build covariance on the input device without a full-scene tensor."""
+        w, x, y, z = rotation.unbind(dim=1)
+        matrix = torch.empty(
+            (rotation.shape[0], 3, 3),
+            dtype=rotation.dtype,
+            device=rotation.device,
+        )
+        matrix[:, 0, 0] = 1 - 2 * (y * y + z * z)
+        matrix[:, 0, 1] = 2 * (x * y - w * z)
+        matrix[:, 0, 2] = 2 * (x * z + w * y)
+        matrix[:, 1, 0] = 2 * (x * y + w * z)
+        matrix[:, 1, 1] = 1 - 2 * (x * x + z * z)
+        matrix[:, 1, 2] = 2 * (y * z - w * x)
+        matrix[:, 2, 0] = 2 * (x * z - w * y)
+        matrix[:, 2, 1] = 2 * (y * z + w * x)
+        matrix[:, 2, 2] = 1 - 2 * (x * x + y * y)
+        factor = matrix * scaling.unsqueeze(1)
+        return factor @ factor.transpose(1, 2)
+
+    @torch.no_grad()
+    def add_mcmc_position_noise(
+        self,
+        noise_lr,
+        xyz_lr,
+        min_opacity=0.005,
+        chunk_size=250_000,
+        generator=None,
+    ):
+        """Apply covariance-shaped SGLD noise to positions in bounded chunks."""
+        noise_lr = float(noise_lr)
+        xyz_lr = float(xyz_lr)
+        if not np.isfinite(noise_lr) or not np.isfinite(xyz_lr):
+            raise ValueError("noise_lr and xyz_lr must be finite")
+        if noise_lr < 0.0 or xyz_lr < 0.0:
+            raise ValueError("noise_lr and xyz_lr must be non-negative")
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise TypeError("chunk_size must be an integer")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        point_count = int(self.get_xyz.shape[0])
+        if point_count == 0 or noise_lr == 0.0 or xyz_lr == 0.0:
+            return point_count
+        noise_scale = noise_lr * xyz_lr
+        for start in range(0, point_count, chunk_size):
+            end = min(start + chunk_size, point_count)
+            covariance = self._mcmc_covariance_from_scale_rotation(
+                self.get_scaling[start:end], self.get_rotation[start:end]
+            )
+            gate = mcmc_noise_gate(
+                self.get_opacity[start:end], min_opacity=float(min_opacity)
+            )
+            standard_noise = torch.randn(
+                (end - start, 3),
+                dtype=self._xyz.dtype,
+                device=self._xyz.device,
+                generator=generator,
+            )
+            shaped_noise = torch.bmm(
+                covariance, (standard_noise * gate * noise_scale).unsqueeze(-1)
+            ).squeeze(-1)
+            self._xyz[start:end].add_(shaped_noise)
+        return point_count
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

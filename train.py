@@ -43,6 +43,15 @@ from utils.improved_gs_utils import (
     should_step_optimizer,
     validate_improvedgs_resume_config,
 )
+from utils.mcmc_utils import (
+    build_mcmc_resume_config,
+    capture_mcmc_runtime_state,
+    restore_mcmc_runtime_state,
+    validate_mcmc_initialization,
+    validate_mcmc_options,
+    validate_mcmc_resume_config,
+    write_mcmc_config,
+)
 
 from lpipsPyTorch import lpips
 
@@ -100,9 +109,9 @@ _PIXELGS_CONFIG_KEYS = (
 def _validate_density_control_options(opt):
     """Validate density-control arguments without changing 3DGS defaults."""
     density_control = str(opt.density_control).lower()
-    if density_control not in ("3dgs", "pixelgs", "improvedgs"):
+    if density_control not in ("3dgs", "pixelgs", "improvedgs", "mcmc"):
         raise ValueError(
-            "density_control must be one of '3dgs', 'pixelgs', or 'improvedgs'"
+            "density_control must be one of '3dgs', 'pixelgs', 'improvedgs', or 'mcmc'"
         )
     opt.density_control = density_control
 
@@ -126,6 +135,14 @@ def _validate_density_control_options(opt):
             raise ValueError("densify_until_iter must be greater than densify_from_iter")
         if float(opt.densify_grad_threshold) < 0.0:
             raise ValueError("densify_grad_threshold must be non-negative")
+
+    if density_control == "mcmc":
+        # The MCMC Markov-chain lifecycle is a complete, standalone density
+        # controller. Normalize every Improved-GS component off so saved
+        # metadata cannot suggest that a hybrid method was trained.
+        for name in component_names:
+            setattr(opt, name, 0)
+        return
 
     if density_control != "improvedgs":
         # The model uses this flag to allocate an additional AbsGrad buffer.
@@ -221,6 +238,51 @@ def _validate_pixelgs_resume_config(runtime_state, current_config):
             "the original Pixel-GS threshold, densification settings, cap, and "
             "seed.".format(", ".join(differing_keys))
         )
+
+
+def _checkpoint_iteration(path):
+    """Return the numeric suffix of ``chkpntN.pth`` or ``None``."""
+    name = Path(path).name
+    if not name.startswith("chkpnt") or not name.endswith(".pth"):
+        return None
+    suffix = name[len("chkpnt"):-len(".pth")]
+    return int(suffix) if suffix.isdigit() else None
+
+
+def _atomic_save_checkpoint(payload, path):
+    """Write a checkpoint atomically so a failed save cannot corrupt resume."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = Path(str(path) + ".tmp")
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, path)
+    except Exception:
+        # A partial temporary file is never considered a resumable checkpoint.
+        # Leave it in place for post-mortem inspection; the next save overwrites it.
+        raise
+    return path
+
+
+def _prune_old_checkpoints(model_path, keep_last):
+    """Remove older completed checkpoints after a newer atomic save succeeds."""
+    keep_last = int(keep_last)
+    if keep_last < 0:
+        raise ValueError("checkpoint_keep_last must be non-negative")
+    if keep_last == 0:
+        return []
+
+    candidates = []
+    for path in Path(model_path).glob("chkpnt*.pth"):
+        iteration = _checkpoint_iteration(path)
+        if iteration is not None:
+            candidates.append((iteration, path))
+    candidates.sort(key=lambda item: item[0])
+    removed = []
+    for _, path in candidates[:-keep_last]:
+        path.unlink()
+        removed.append(path)
+    return removed
 
 
 def _visibility_as_bool(visibility_filter, num_gaussians, device):
@@ -436,11 +498,59 @@ def render_test_samples(dataset, gaussians, pipe, background, iteration,
               f"(kiem tra gt_dir: {gt_dir})", flush=True)
 
 # VAR: add cap max
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, cap_max=-1, analyse_path=None, orig_dir = None, test_render_every=50, test_render_samples=15, seed=0):
+def training(
+    dataset,
+    opt,
+    pipe,
+    testing_iterations,
+    saving_iterations,
+    checkpoint_iterations,
+    checkpoint,
+    debug_from,
+    cap_max=-1,
+    analyse_path=None,
+    orig_dir=None,
+    test_render_every=50,
+    test_render_samples=15,
+    seed=0,
+    stop_after_iteration=-1,
+    checkpoint_keep_last=0,
+    stats_path=None,
+):
 
     _validate_density_control_options(opt)
     improved_mode = opt.density_control == "improvedgs"
     pixelgs_mode = opt.density_control == "pixelgs"
+    mcmc_mode = opt.density_control == "mcmc"
+
+    stop_after_iteration = int(stop_after_iteration)
+    if stop_after_iteration == -1:
+        run_until_iteration = int(opt.iterations)
+    elif 0 < stop_after_iteration <= int(opt.iterations):
+        run_until_iteration = stop_after_iteration
+    else:
+        raise ValueError(
+            "stop_after_iteration must be -1 or in [1, iterations]"
+        )
+    checkpoint_keep_last = int(checkpoint_keep_last)
+    if checkpoint_keep_last < 0:
+        raise ValueError("checkpoint_keep_last must be non-negative")
+    if mcmc_mode:
+        validate_mcmc_options(opt, int(cap_max))
+        validate_mcmc_initialization(dataset)
+        if (
+            str(dataset.mcmc_init_type).lower() == "random"
+            and int(dataset.mcmc_random_points) > int(cap_max)
+        ):
+            raise ValueError(
+                "mcmc_random_points ({}) cannot exceed cap_max ({})".format(
+                    dataset.mcmc_random_points, cap_max
+                )
+            )
+        # Scene keeps every legacy method on the ordinary SfM loader. These
+        # transient fields opt MCMC into its explicit random/SfM initializer.
+        dataset.mcmc_enabled = True
+        dataset.mcmc_init_seed = int(seed)
 
     if (
         improved_mode
@@ -460,6 +570,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "force-reinstall submodules/diff-gaussian-rasterization."
         )
 
+    if mcmc_mode:
+        try:
+            from diff_gaussian_rasterization import compute_relocation as _compute_relocation
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "MCMC requires the tracked rasterizer patch with the "
+                "compute_relocation CUDA symbol. Apply the project patch and "
+                "force-reinstall submodules/diff-gaussian-rasterization."
+            ) from error
+        del _compute_relocation
+
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
     if improved_mode and bool(opt.use_mu) and opt.optimizer_type == "sparse_adam":
@@ -471,7 +592,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     first_iter = 0
     checkpoint_runtime_state = None
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer = prepare_output_and_logger(dataset, write_config=False)
     improved_resume_config = (
         build_improvedgs_resume_config(dataset, opt, pipe, seed)
         if improved_mode
@@ -480,6 +601,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     pixelgs_resume_config = (
         _build_pixelgs_config(opt, seed, cap_max)
         if pixelgs_mode
+        else None
+    )
+    mcmc_resume_config = (
+        build_mcmc_resume_config(dataset, opt, pipe, seed, int(cap_max))
+        if mcmc_mode
         else None
     )
     if improved_mode:
@@ -499,7 +625,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         analyse_file = open(analyse_path, "w")
         analyse_file.write("iteration,L1,SSIM,LPIPS,PSNR,score\n")
 
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    gaussians = GaussianModel(
+        dataset.sh_degree,
+        opt.optimizer_type,
+        mcmc_init_mode=(opt.mcmc_init_mode if mcmc_mode else "legacy"),
+    )
     scene = Scene(dataset, gaussians)
     pixelgs_absolute_depth_threshold = (
         float(opt.pixelgs_depth_threshold) * float(scene.cameras_extent)
@@ -552,6 +682,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             _validate_pixelgs_resume_config(
                 checkpoint_runtime_state, pixelgs_resume_config
             )
+        elif mcmc_mode:
+            validate_mcmc_resume_config(
+                checkpoint_runtime_state, mcmc_resume_config
+            )
         elif not improved_mode:
             raise ValueError(
                 "This checkpoint contains method-specific runtime state but the "
@@ -567,6 +701,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "the caller is responsible for using the original flags.",
                     flush=True,
                 )
+
+        if improved_mode or mcmc_mode:
             current_cameras_by_name = {
                 camera.image_name: camera for camera in all_train_cameras
             }
@@ -615,7 +751,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
     ) if improved_mode and bool(opt.use_rap) else set()
 
-    if checkpoint_runtime_state is not None and improved_mode:
+    if checkpoint_runtime_state is not None and (improved_mode or mcmc_mode):
         remaining_names = checkpoint_runtime_state.get("remaining_camera_names")
         if remaining_names is not None:
             current_name_to_index = {
@@ -643,12 +779,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 raise ValueError("Checkpoint contains invalid remaining camera indices")
         viewpoint_indices = saved_indices
         viewpoint_stack = [all_train_cameras[index] for index in saved_indices]
-        restore_improvedgs_runtime_state(gaussians, checkpoint_runtime_state)
-    elif checkpoint and pixelgs_mode and checkpoint_runtime_state is None:
+        if mcmc_mode:
+            restore_mcmc_runtime_state(gaussians, checkpoint_runtime_state)
+        else:
+            restore_improvedgs_runtime_state(gaussians, checkpoint_runtime_state)
+    elif checkpoint and (pixelgs_mode or mcmc_mode) and checkpoint_runtime_state is None:
         raise ValueError(
-            "Cannot verify Pixel-GS settings in this legacy checkpoint. Resume "
-            "from a checkpoint created with --density_control pixelgs by this "
-            "implementation."
+            "Cannot verify {} settings or restore its stochastic runtime state "
+            "from this legacy checkpoint. Resume from a checkpoint created by "
+            "this implementation.".format(opt.density_control)
         )
     elif checkpoint and improved_mode:
         interval = mu_update_interval(
@@ -671,6 +810,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "runtime state; resume is supported but not bitwise reproducible.",
             flush=True,
         )
+
+    if int(first_iter) >= run_until_iteration:
+        raise ValueError(
+            "Checkpoint iteration {} is not before this stage target {}".format(
+                first_iter, run_until_iteration
+            )
+        )
+    if mcmc_mode and int(gaussians.get_xyz.shape[0]) > int(cap_max):
+        raise ValueError(
+            "The initialized/checkpoint model contains {} Gaussians, exceeding "
+            "the MCMC cap {}.".format(gaussians.get_xyz.shape[0], cap_max)
+        )
+
     if improved_mode:
         # Write metadata only after a resumed checkpoint has passed all
         # compatibility checks, so a failed resume cannot overwrite the
@@ -678,12 +830,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         _write_improvedgs_config(dataset, opt, seed)
     elif pixelgs_mode:
         _write_pixelgs_config(dataset, pixelgs_resume_config)
+    elif mcmc_mode:
+        write_mcmc_config(dataset, mcmc_resume_config)
+    _write_cfg_args(dataset)
+
+    stats_file = None
+    if stats_path is not None:
+        if not mcmc_mode:
+            raise ValueError("stats_path is currently supported only for MCMC")
+        stats_path = Path(stats_path)
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        stats_file = open(
+            stats_path,
+            "a" if checkpoint else "w",
+            encoding="utf-8",
+            buffering=1,
+        )
+        stats_file.write(
+            json.dumps(
+                {
+                    "event": "run_start",
+                    "first_iteration": int(first_iter),
+                    "run_until_iteration": int(run_until_iteration),
+                    "total_iterations": int(opt.iterations),
+                    "cap_max": int(cap_max),
+                    "seed": int(seed),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    progress_bar = tqdm(
+        range(first_iter, run_until_iteration), desc="Training progress"
+    )
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):
+    for iteration in range(first_iter, run_until_iteration + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -701,7 +885,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration)
+        xyz_lr = gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -778,6 +962,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        mcmc_opacity_penalty = 0.0
+        mcmc_scale_penalty = 0.0
+        if mcmc_mode:
+            mcmc_opacity_penalty = (
+                float(opt.mcmc_opacity_reg) * gaussians.get_opacity.abs().mean()
+            )
+            mcmc_scale_penalty = (
+                float(opt.mcmc_scale_reg) * gaussians.get_scaling.abs().mean()
+            )
+            loss = loss + mcmc_opacity_penalty + mcmc_scale_penalty
+
         loss.backward()
 
         iter_end.record()
@@ -799,7 +994,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # VAR: log gaussians numbers 
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", "N": f"{gaussians.get_xyz.shape[0]}"})
                 progress_bar.update(10)
-            if iteration == opt.iterations:
+            if iteration == run_until_iteration:
                 progress_bar.close()
 
             # Log and save
@@ -914,6 +1109,69 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     or (dataset.white_background and iteration == opt.densify_from_iter)
                 ):
                     gaussians.reset_opacity()
+            elif mcmc_mode:
+                mcmc_density_report = None
+                if (
+                    int(opt.densify_from_iter) < iteration
+                    < int(opt.densify_until_iter)
+                    and iteration % int(opt.densification_interval) == 0
+                ):
+                    mcmc_density_report = gaussians.mcmc_relocate_and_grow(
+                        cap_max=int(cap_max),
+                        min_opacity=float(opt.mcmc_min_opacity),
+                        growth_rate=float(opt.mcmc_growth_rate),
+                    )
+                    tqdm.write(
+                        "[MCMC @ {iteration}] N {before}->{after}, "
+                        "relocated={relocated}, added={added}, cap={cap_max}".format(
+                            iteration=iteration, **mcmc_density_report
+                        )
+                    )
+
+                # Match the official MCMC lifecycle: structural Markov moves,
+                # then Adam, then covariance-shaped SGLD on xyz only.
+                if iteration < int(opt.iterations):
+                    gaussians.exposure_optimizer.step()
+                    gaussians.exposure_optimizer.zero_grad(set_to_none=True)
+                    gaussians.optimizer.step()
+                    gaussians.optimizer.zero_grad(set_to_none=True)
+                    gaussians.add_mcmc_position_noise(
+                        noise_lr=float(opt.mcmc_noise_lr),
+                        xyz_lr=float(xyz_lr),
+                        min_opacity=float(opt.mcmc_min_opacity),
+                        chunk_size=int(opt.mcmc_noise_chunk_size),
+                    )
+
+                if stats_file is not None and (
+                    mcmc_density_report is not None
+                    or iteration % int(opt.densification_interval) == 0
+                    or iteration == run_until_iteration
+                ):
+                    stats_record = {
+                        "event": (
+                            "density_control"
+                            if mcmc_density_report is not None
+                            else "iteration"
+                        ),
+                        "iteration": int(iteration),
+                        "gaussians": int(gaussians.get_xyz.shape[0]),
+                        "loss": float(loss.item()),
+                        "l1": float(Ll1.item()),
+                        "ssim": float(ssim_value.item()),
+                        "depth_loss": float(Ll1depth),
+                        "opacity_penalty": float(mcmc_opacity_penalty.item()),
+                        "scale_penalty": float(mcmc_scale_penalty.item()),
+                        "xyz_lr": float(xyz_lr),
+                        "peak_vram_allocated_bytes": int(
+                            torch.cuda.max_memory_allocated()
+                        ),
+                        "peak_vram_reserved_bytes": int(
+                            torch.cuda.max_memory_reserved()
+                        ),
+                    }
+                    if mcmc_density_report is not None:
+                        stats_record.update(mcmc_density_report)
+                    stats_file.write(json.dumps(stats_record, sort_keys=True) + "\n")
             else:
                 # Densification
                 if iteration < opt.densify_until_iter:
@@ -965,7 +1223,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.optimizer.step()
                         gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
+            checkpoint_due = iteration in checkpoint_iterations or (
+                mcmc_mode
+                and iteration == run_until_iteration
+                and run_until_iteration < int(opt.iterations)
+            )
+            if checkpoint_due:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 if improved_mode:
                     runtime_state = capture_improvedgs_runtime_state(
@@ -983,6 +1246,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     checkpoint_payload = (
                         gaussians.capture(), iteration, runtime_state
                     )
+                elif mcmc_mode:
+                    runtime_state = capture_mcmc_runtime_state(
+                        gaussians,
+                        viewpoint_indices,
+                        remaining_camera_names=[
+                            all_train_cameras[index].image_name
+                            for index in viewpoint_indices
+                        ],
+                        camera_order_names=[
+                            camera.image_name for camera in all_train_cameras
+                        ],
+                        # The final iteration cannot be resumed further and its
+                        # dense pending gradients would add roughly another
+                        # model copy to the checkpoint.
+                        include_gradients=(iteration < int(opt.iterations)),
+                    )
+                    runtime_state["resume_config"] = mcmc_resume_config
+                    checkpoint_payload = (
+                        gaussians.capture(), iteration, runtime_state
+                    )
                 elif pixelgs_mode:
                     checkpoint_payload = (
                         gaussians.capture(),
@@ -994,14 +1277,53 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     )
                 else:
                     checkpoint_payload = (gaussians.capture(), iteration)
-                torch.save(
+                checkpoint_path = _atomic_save_checkpoint(
                     checkpoint_payload,
-                    scene.model_path + "/chkpnt" + str(iteration) + ".pth",
+                    Path(scene.model_path) / ("chkpnt" + str(iteration) + ".pth"),
                 )
+                removed_checkpoints = _prune_old_checkpoints(
+                    scene.model_path, checkpoint_keep_last
+                )
+                if removed_checkpoints:
+                    print(
+                        "[Checkpoint retention] kept newest {}, removed {}".format(
+                            checkpoint_keep_last, len(removed_checkpoints)
+                        ),
+                        flush=True,
+                    )
+                print("[Checkpoint] {}".format(checkpoint_path), flush=True)
     if analyse_file is not None:
         analyse_file.close()
+    if stats_file is not None:
+        stats_file.write(
+            json.dumps(
+                {
+                    "event": "run_end",
+                    "iteration": int(run_until_iteration),
+                    "gaussians": int(gaussians.get_xyz.shape[0]),
+                    "peak_vram_allocated_bytes": int(
+                        torch.cuda.max_memory_allocated()
+                    ),
+                    "peak_vram_reserved_bytes": int(
+                        torch.cuda.max_memory_reserved()
+                    ),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        stats_file.close()
 
-def prepare_output_and_logger(args):    
+def _write_cfg_args(args):
+    """Atomically update cfg_args only after resume compatibility succeeds."""
+    path = Path(args.model_path) / "cfg_args"
+    temporary_path = Path(str(path) + ".tmp")
+    with open(temporary_path, "w", encoding="utf-8") as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(args))))
+    os.replace(temporary_path, path)
+
+
+def prepare_output_and_logger(args, write_config=True):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -1012,8 +1334,8 @@ def prepare_output_and_logger(args):
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+    if write_config:
+        _write_cfg_args(args)
 
     # Create Tensorboard writer
     tb_writer = None
@@ -1080,6 +1402,27 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument(
+        "--stop_after_iteration",
+        type=int,
+        default=-1,
+        help=(
+            "Stop this process at an intermediate iteration without changing "
+            "the full optimization schedule."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint_keep_last",
+        type=int,
+        default=0,
+        help="Keep only the newest N completed checkpoints; 0 keeps all.",
+    )
+    parser.add_argument(
+        "--stats_path",
+        type=str,
+        default=None,
+        help="Optional JSONL output for MCMC training telemetry.",
+    )
     parser.add_argument("--cap_max", type=int, default=-1)
     parser.add_argument("--analyse", type=str, default=None, help="Đường dẫn file log điểm số. Không truyền = không log.")
     parser.add_argument("--orig_dir", type=str, default=None,
@@ -1115,6 +1458,9 @@ if __name__ == "__main__":
         args.test_render_every,
         args.test_render_samples,
         seed=args.seed,
+        stop_after_iteration=args.stop_after_iteration,
+        checkpoint_keep_last=args.checkpoint_keep_last,
+        stats_path=args.stats_path,
     )
     # All done
     print("\nTraining complete.")

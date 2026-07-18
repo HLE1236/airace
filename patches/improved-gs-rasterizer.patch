@@ -1,3 +1,16 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f8cf822..b4b7deb 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,6 +28,8 @@ add_library(CudaRasterizer
+ 	cuda_rasterizer/rasterizer_impl.cu
+ 	cuda_rasterizer/rasterizer_impl.h
+ 	cuda_rasterizer/rasterizer.h
++	cuda_rasterizer/utils.cu
++	cuda_rasterizer/utils.h
+ )
+ 
+ set_target_properties(CudaRasterizer PROPERTIES CUDA_ARCHITECTURES "70;75;86")
 diff --git a/cuda_rasterizer/backward.cu b/cuda_rasterizer/backward.cu
 index 006b1ef..df42ed8 100644
 --- a/cuda_rasterizer/backward.cu
@@ -222,8 +235,110 @@ index 41c4ed3..002b6cf 100644
  		dL_dconic,
  		dL_dinvdepth,
  		dL_dopacity,
+diff --git a/cuda_rasterizer/utils.cu b/cuda_rasterizer/utils.cu
+new file mode 100644
+index 0000000..c757ef5
+--- /dev/null
++++ b/cuda_rasterizer/utils.cu
+@@ -0,0 +1,71 @@
++#include "utils.h"
++
++#include <cmath>
++
++
++// Equation (9) in "3D Gaussian Splatting as Markov Chain Monte Carlo".
++__global__ void computeRelocationCUDA(
++	int P,
++	const float* opacity_old,
++	const float* scale_old,
++	const int* N,
++	const float* binoms,
++	int n_max,
++	float* opacity_new,
++	float* scale_new)
++{
++	const int idx = threadIdx.x + blockIdx.x * blockDim.x;
++	if (idx >= P)
++		return;
++
++	// The public wrapper already clamps N. Keep this kernel-side clamp as a
++	// final guard for direct extension callers so binomial-table indexing is safe.
++	int multiplicity = N[idx];
++	multiplicity = multiplicity < 1 ? 1 : multiplicity;
++	multiplicity = multiplicity > n_max - 1 ? n_max - 1 : multiplicity;
++	const float old_opacity = opacity_old[idx];
++	const float new_opacity =
++		1.0f - powf(1.0f - old_opacity, 1.0f / multiplicity);
++	opacity_new[idx] = new_opacity;
++
++	float denominator = 0.0f;
++	for (int i = 1; i <= multiplicity; ++i)
++	{
++		for (int k = 0; k <= i - 1; ++k)
++		{
++			const float binomial = binoms[(i - 1) * n_max + k];
++			const float sign = (k & 1) == 0 ? 1.0f : -1.0f;
++			const float term = sign / sqrtf(static_cast<float>(k + 1))
++				* powf(new_opacity, static_cast<float>(k + 1));
++			denominator += binomial * term;
++		}
++	}
++
++	const float scale_coefficient = old_opacity / denominator;
++	for (int axis = 0; axis < 3; ++axis)
++		scale_new[idx * 3 + axis] =
++			scale_coefficient * scale_old[idx * 3 + axis];
++}
++
++void UTILS::ComputeRelocation(
++	int P,
++	const float* opacity_old,
++	const float* scale_old,
++	const int* N,
++	const float* binoms,
++	int n_max,
++	float* opacity_new,
++	float* scale_new)
++{
++	const int block_size = 256;
++	const int num_blocks = (P + block_size - 1) / block_size;
++	computeRelocationCUDA<<<num_blocks, block_size>>>(
++		P,
++		opacity_old,
++		scale_old,
++		N,
++		binoms,
++		n_max,
++		opacity_new,
++		scale_new);
++}
+diff --git a/cuda_rasterizer/utils.h b/cuda_rasterizer/utils.h
+new file mode 100644
+index 0000000..68ccb2d
+--- /dev/null
++++ b/cuda_rasterizer/utils.h
+@@ -0,0 +1,19 @@
++#ifndef CUDA_RASTERIZER_UTILS_H_INCLUDED
++#define CUDA_RASTERIZER_UTILS_H_INCLUDED
++
++#include <cuda_runtime.h>
++
++namespace UTILS
++{
++	void ComputeRelocation(
++		int P,
++		const float* opacity_old,
++		const float* scale_old,
++		const int* N,
++		const float* binoms,
++		int n_max,
++		float* opacity_new,
++		float* scale_new);
++}
++
++#endif
 diff --git a/diff_gaussian_rasterization/__init__.py b/diff_gaussian_rasterization/__init__.py
-index 7f228ce..71f12f9 100644
+index 7f228ce..0897a00 100644
 --- a/diff_gaussian_rasterization/__init__.py
 +++ b/diff_gaussian_rasterization/__init__.py
 @@ -29,7 +29,7 @@ def rasterize_gaussians(
@@ -328,11 +443,88 @@ index 7f228ce..71f12f9 100644
  
  class GaussianRasterizer(nn.Module):
      def __init__(self, raster_settings):
+@@ -206,3 +247,52 @@ class GaussianRasterizer(nn.Module):
+             raster_settings, 
+         )
+ 
++
++def compute_relocation(opacity_old, scale_old, N, binoms, n_max):
++    """Apply the analytical 3DGS-MCMC opacity/scale relocation update.
++
++    The CUDA implementation follows Equation (9) of the 3DGS-MCMC paper.
++    ``N`` is clamped to the valid binomial-table range, matching the official
++    training wrapper, before it is converted to the kernel's int32 ABI.
++    """
++    tensors = {
++        "opacity_old": opacity_old,
++        "scale_old": scale_old,
++        "N": N,
++        "binoms": binoms,
++    }
++    for name, tensor in tensors.items():
++        if not isinstance(tensor, torch.Tensor):
++            raise TypeError(f"{name} must be a torch.Tensor")
++        if not tensor.is_cuda:
++            raise ValueError(f"{name} must be a CUDA tensor")
++
++    if not isinstance(n_max, int) or isinstance(n_max, bool) or n_max < 2:
++        raise ValueError("n_max must be an integer greater than or equal to 2")
++    if opacity_old.dtype != torch.float32 or opacity_old.ndim != 1:
++        raise ValueError("opacity_old must be a float32 tensor with shape [P]")
++    if (
++        scale_old.dtype != torch.float32
++        or scale_old.ndim != 2
++        or scale_old.shape != (opacity_old.shape[0], 3)
++    ):
++        raise ValueError("scale_old must be a float32 tensor with shape [P, 3]")
++    if N.dtype not in (torch.int32, torch.int64) or N.shape != opacity_old.shape:
++        raise ValueError("N must be an int32/int64 tensor with shape [P]")
++    if (
++        binoms.dtype != torch.float32
++        or binoms.ndim != 2
++        or binoms.shape[0] < n_max
++        or binoms.shape[1] < n_max
++    ):
++        raise ValueError(
++            "binoms must be a float32 tensor with shape [n_max, n_max] or larger"
++        )
++    if any(tensor.device != opacity_old.device for tensor in tensors.values()):
++        raise ValueError("all relocation tensors must be on the same CUDA device")
++
++    multiplicities = N.to(dtype=torch.int32).clamp(min=1, max=n_max - 1)
++    return _C.compute_relocation(
++        opacity_old, scale_old, multiplicities, binoms, n_max
++    )
++
+diff --git a/ext.cpp b/ext.cpp
+index d768779..82e2c73 100644
+--- a/ext.cpp
++++ b/ext.cpp
+@@ -16,4 +16,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+   m.def("rasterize_gaussians", &RasterizeGaussiansCUDA);
+   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
+   m.def("mark_visible", &markVisible);
+-}
+\ No newline at end of file
++  m.def("compute_relocation", &ComputeRelocationCUDA);
++}
 diff --git a/rasterize_points.cu b/rasterize_points.cu
-index e625c19..d292d31 100644
+index e625c19..e5e8a39 100644
 --- a/rasterize_points.cu
 +++ b/rasterize_points.cu
-@@ -32,7 +32,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
+@@ -20,9 +20,11 @@
+ #include <memory>
+ #include "cuda_rasterizer/config.h"
+ #include "cuda_rasterizer/rasterizer.h"
++#include "cuda_rasterizer/utils.h"
+ #include <fstream>
+ #include <string>
+ #include <functional>
++#include <limits>
+ 
+ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
+     auto lambda = [&t](size_t N) {
+@@ -32,7 +34,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
      return lambda;
  }
  
@@ -341,7 +533,7 @@ index e625c19..d292d31 100644
  RasterizeGaussiansCUDA(
  	const torch::Tensor& background,
  	const torch::Tensor& means3D,
-@@ -53,6 +53,8 @@ RasterizeGaussiansCUDA(
+@@ -53,6 +55,8 @@ RasterizeGaussiansCUDA(
  	const torch::Tensor& campos,
  	const bool prefiltered,
  	const bool antialiasing,
@@ -350,7 +542,7 @@ index e625c19..d292d31 100644
  	const bool debug)
  {
    if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
-@@ -74,6 +76,29 @@ RasterizeGaussiansCUDA(
+@@ -74,6 +78,29 @@ RasterizeGaussiansCUDA(
    out_invdepthptr = out_invdepth.data<float>();
  
    torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
@@ -380,7 +572,7 @@ index e625c19..d292d31 100644
    
    torch::Device device(torch::kCUDA);
    torch::TensorOptions options(torch::kByte);
-@@ -116,11 +141,14 @@ RasterizeGaussiansCUDA(
+@@ -116,11 +143,14 @@ RasterizeGaussiansCUDA(
  		prefiltered,
  		out_color.contiguous().data<float>(),
  		out_invdepthptr,
@@ -396,7 +588,7 @@ index e625c19..d292d31 100644
  }
  
  std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-@@ -161,7 +189,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
+@@ -161,7 +191,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
    }
  
    torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
@@ -407,8 +599,69 @@ index e625c19..d292d31 100644
    torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
    torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means3D.options());
    torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
+@@ -242,3 +274,60 @@ torch::Tensor markVisible(
+   
+   return present;
+ }
++
++std::tuple<torch::Tensor, torch::Tensor> ComputeRelocationCUDA(
++		const torch::Tensor& opacity_old,
++		const torch::Tensor& scale_old,
++		const torch::Tensor& N,
++		const torch::Tensor& binoms,
++		const int n_max)
++{
++  TORCH_CHECK(opacity_old.is_cuda(), "opacity_old must be a CUDA tensor");
++  TORCH_CHECK(scale_old.is_cuda(), "scale_old must be a CUDA tensor");
++  TORCH_CHECK(N.is_cuda(), "N must be a CUDA tensor");
++  TORCH_CHECK(binoms.is_cuda(), "binoms must be a CUDA tensor");
++  TORCH_CHECK(opacity_old.scalar_type() == torch::kFloat32,
++      "opacity_old must have dtype float32");
++  TORCH_CHECK(scale_old.scalar_type() == torch::kFloat32,
++      "scale_old must have dtype float32");
++  TORCH_CHECK(N.scalar_type() == torch::kInt32, "N must have dtype int32");
++  TORCH_CHECK(binoms.scalar_type() == torch::kFloat32,
++      "binoms must have dtype float32");
++  TORCH_CHECK(opacity_old.dim() == 1, "opacity_old must have shape [P]");
++
++  const int64_t P = opacity_old.size(0);
++  TORCH_CHECK(scale_old.dim() == 2 && scale_old.size(0) == P && scale_old.size(1) == 3,
++      "scale_old must have shape [P, 3]");
++  TORCH_CHECK(N.dim() == 1 && N.size(0) == P, "N must have shape [P]");
++  TORCH_CHECK(n_max >= 2, "n_max must be at least 2");
++  TORCH_CHECK(binoms.dim() == 2 && binoms.size(0) >= n_max && binoms.size(1) >= n_max,
++      "binoms must have shape [n_max, n_max] or larger");
++  TORCH_CHECK(scale_old.device() == opacity_old.device()
++      && N.device() == opacity_old.device()
++      && binoms.device() == opacity_old.device(),
++      "all relocation tensors must be on the same CUDA device");
++  TORCH_CHECK(P <= std::numeric_limits<int>::max(),
++      "too many Gaussians for the relocation CUDA kernel");
++
++  torch::Tensor final_opacity = torch::empty({P}, opacity_old.options());
++  torch::Tensor final_scale = torch::empty({3 * P}, scale_old.options());
++
++  if (P != 0)
++  {
++    const torch::Tensor opacity_contiguous = opacity_old.contiguous();
++    const torch::Tensor scale_contiguous = scale_old.contiguous();
++    const torch::Tensor n_contiguous = N.contiguous();
++    const torch::Tensor binoms_contiguous = binoms.contiguous();
++    UTILS::ComputeRelocation(
++        static_cast<int>(P),
++        opacity_contiguous.data_ptr<float>(),
++        scale_contiguous.data_ptr<float>(),
++        n_contiguous.data_ptr<int>(),
++        binoms_contiguous.data_ptr<float>(),
++        n_max,
++        final_opacity.data_ptr<float>(),
++        final_scale.data_ptr<float>());
++  }
++
++  return std::make_tuple(final_opacity, final_scale);
++}
 diff --git a/rasterize_points.h b/rasterize_points.h
-index 82cbd4f..e2f12ea 100644
+index 82cbd4f..46b711b 100644
 --- a/rasterize_points.h
 +++ b/rasterize_points.h
 @@ -15,7 +15,7 @@
@@ -429,3 +682,26 @@ index 82cbd4f..e2f12ea 100644
  	const bool debug);
  
  std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+@@ -69,3 +71,10 @@ torch::Tensor markVisible(
+ 		torch::Tensor& means3D,
+ 		torch::Tensor& viewmatrix,
+ 		torch::Tensor& projmatrix);
++
++std::tuple<torch::Tensor, torch::Tensor> ComputeRelocationCUDA(
++		const torch::Tensor& opacity_old,
++		const torch::Tensor& scale_old,
++		const torch::Tensor& N,
++		const torch::Tensor& binoms,
++		const int n_max);
+diff --git a/setup.py b/setup.py
+index bb7220d..e702754 100644
+--- a/setup.py
++++ b/setup.py
+@@ -24,6 +24,7 @@ setup(
+             "cuda_rasterizer/rasterizer_impl.cu",
+             "cuda_rasterizer/forward.cu",
+             "cuda_rasterizer/backward.cu",
++            "cuda_rasterizer/utils.cu",
+             "rasterize_points.cu",
+             "ext.cpp"],
+             extra_compile_args={"nvcc": ["-I" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/")]})

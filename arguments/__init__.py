@@ -56,6 +56,11 @@ class ModelParams(ParamGroup):
         self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
+        # The official 3DGS-MCMC experiments initialize 100K points randomly.
+        # Scene only consumes these fields when training explicitly selects the
+        # MCMC density controller, so every existing method remains SfM-based.
+        self.mcmc_init_type = "random"
+        self.mcmc_random_points = 100_000
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -98,9 +103,10 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.optimizer_type = "default"
 
-        # ImprovedGS is opt-in so the default 3DGS training path remains
-        # unchanged. Component switches intentionally use integer 0/1 values:
-        # ParamGroup's store_true handling cannot disable a default-true bool.
+        # Alternative density controllers are opt-in so the default 3DGS
+        # training path remains unchanged. Component switches intentionally use
+        # integer 0/1 values: ParamGroup's store_true handling cannot disable a
+        # default-true bool.
         self.density_control = "3dgs"
         # Pixel-GS scales the screen-space densification gradient for points
         # close to the camera.  The absolute threshold used by the renderer is
@@ -131,6 +137,16 @@ class OptimizationParams(ParamGroup):
         self.mu_interval = 5
         self.mu_second_start_iter = 22_500
         self.mu_second_interval = 20
+
+        # 3DGS-MCMC is an independent density-control path. Prefix its options
+        # so they cannot silently alter 3DGS, Pixel-GS, or Improved-GS runs.
+        self.mcmc_init_mode = "paper"
+        self.mcmc_noise_lr = 500_000.0
+        self.mcmc_opacity_reg = 0.01
+        self.mcmc_scale_reg = 0.01
+        self.mcmc_growth_rate = 1.05
+        self.mcmc_min_opacity = 0.005
+        self.mcmc_noise_chunk_size = 250_000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
