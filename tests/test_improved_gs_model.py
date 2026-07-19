@@ -183,5 +183,119 @@ class ModelStateTests(unittest.TestCase):
         self.assertEqual(len(model.optimizer.state), 0)
 
 
+class PixelGsDensificationStatsTests(unittest.TestCase):
+    @staticmethod
+    def _viewspace_with_xy_gradient(x_gradient, y_gradient=0.0):
+        viewspace = torch.zeros((1, 4), dtype=torch.float32, requires_grad=True)
+        viewspace.grad = torch.tensor(
+            [[x_gradient, y_gradient, 0.0, 0.0]], dtype=torch.float32
+        )
+        return viewspace
+
+    def test_pixel_weighted_gradient_average_is_2_8(self):
+        model = _make_model([[1.0, 1.0, 1.0]])
+        model.xyz_gradient_accum.zero_()
+        model.denom.zero_()
+
+        model.add_densification_stats_pixelgs(
+            self._viewspace_with_xy_gradient(1.0),
+            torch.tensor([0]),
+            torch.tensor([1.0]),
+            torch.tensor([1.0]),
+        )
+        model.add_densification_stats_pixelgs(
+            self._viewspace_with_xy_gradient(3.0),
+            torch.tensor([0]),
+            torch.tensor([9.0]),
+            torch.tensor([1.0]),
+        )
+
+        score = model.xyz_gradient_accum / model.denom.clamp_min(1e-12)
+        self.assertAlmostEqual(float(model.xyz_gradient_accum[0]), 28.0)
+        self.assertAlmostEqual(float(model.denom[0]), 10.0)
+        self.assertAlmostEqual(float(score[0]), 2.8, places=6)
+
+    def test_zero_coverage_does_not_change_accumulators(self):
+        model = _make_model([[1.0, 1.0, 1.0]])
+        model.xyz_gradient_accum.fill_(7.0)
+        model.denom.fill_(2.0)
+
+        model.add_densification_stats_pixelgs(
+            self._viewspace_with_xy_gradient(100.0),
+            torch.tensor([0]),
+            torch.tensor([0.0]),
+            torch.tensor([1.0]),
+        )
+
+        self.assertEqual(float(model.xyz_gradient_accum[0]), 7.0)
+        self.assertEqual(float(model.denom[0]), 2.0)
+
+    def test_depth_scale_attenuates_near_gradient_only(self):
+        model = _make_model([[1.0, 1.0, 1.0]])
+        model.xyz_gradient_accum.zero_()
+        model.denom.zero_()
+
+        model.add_densification_stats_pixelgs(
+            self._viewspace_with_xy_gradient(4.0),
+            torch.tensor([0]),
+            torch.tensor([2.0]),
+            torch.tensor([0.25]),
+        )
+        self.assertAlmostEqual(float(model.xyz_gradient_accum[0]), 2.0)
+        self.assertAlmostEqual(float(model.denom[0]), 2.0)
+
+        model.add_densification_stats_pixelgs(
+            self._viewspace_with_xy_gradient(4.0),
+            torch.tensor([0]),
+            torch.tensor([2.0]),
+            torch.tensor([1.0]),
+        )
+        self.assertAlmostEqual(float(model.xyz_gradient_accum[0]), 10.0)
+        self.assertAlmostEqual(float(model.denom[0]), 4.0)
+
+    def test_visibility_index_tensor_updates_only_selected_gaussians(self):
+        model = _make_model([[1.0, 1.0, 1.0]] * 3)
+        viewspace = torch.zeros((3, 4), dtype=torch.float32, requires_grad=True)
+        viewspace.grad = torch.tensor(
+            [
+                [10.0, 0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0, 0.0],
+                [20.0, 0.0, 0.0, 0.0],
+            ]
+        )
+
+        model.add_densification_stats_pixelgs(
+            viewspace,
+            torch.tensor([1]),
+            torch.tensor([5.0, 3.0, 7.0]),
+            torch.tensor([1.0, 0.25, 1.0]),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                model.xyz_gradient_accum.flatten(),
+                torch.tensor([0.0, 1.5, 0.0]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(model.denom.flatten(), torch.tensor([0.0, 3.0, 0.0]))
+        )
+
+    def test_pruning_keeps_pixelgs_accumulators_aligned(self):
+        model = _make_model([[1.0, 1.0, 1.0]] * 3)
+        model.xyz_gradient_accum = torch.tensor([[1.0], [2.0], [3.0]])
+        model.denom = torch.tensor([[10.0], [20.0], [30.0]])
+
+        model.prune_points(torch.tensor([False, True, False]))
+
+        self.assertEqual(model.get_xyz.shape[0], 2)
+        self.assertTrue(
+            torch.equal(model.xyz_gradient_accum.flatten(), torch.tensor([1.0, 3.0]))
+        )
+        self.assertTrue(
+            torch.equal(model.denom.flatten(), torch.tensor([10.0, 30.0]))
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

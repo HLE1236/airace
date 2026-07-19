@@ -18,8 +18,24 @@ from utils.sh_utils import eval_sh
 IMPROVED_GS_RASTERIZER_AVAILABLE = (
     "pixel_weights" in getattr(GaussianRasterizationSettings, "_fields", ())
 )
+PIXEL_GS_RASTERIZER_AVAILABLE = (
+    "track_pixel_counts" in getattr(GaussianRasterizationSettings, "_fields", ())
+)
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, track_gradients=True, pixel_weights=None):
+def render(
+    viewpoint_camera,
+    pc : GaussianModel,
+    pipe,
+    bg_color : torch.Tensor,
+    scaling_modifier=1.0,
+    separate_sh=False,
+    override_color=None,
+    use_trained_exp=False,
+    track_gradients=True,
+    pixel_weights=None,
+    track_pixel_counts=False,
+    pixelgs_depth_threshold=None,
+):
     """
     Render the scene. 
     
@@ -57,6 +73,34 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             )
         pixel_weights = pixel_weights.to(device=pc.get_xyz.device, dtype=torch.float32)
 
+    track_pixel_counts = bool(track_pixel_counts)
+    if track_pixel_counts and not PIXEL_GS_RASTERIZER_AVAILABLE:
+        raise RuntimeError(
+            "Pixel-GS pixel counting requires the tracked rasterizer patch "
+            "and a rebuilt CUDA extension"
+        )
+
+    pixelgs_grad_scale = None
+    if pixelgs_depth_threshold is not None:
+        absolute_depth_threshold = float(pixelgs_depth_threshold)
+        if not math.isfinite(absolute_depth_threshold) or absolute_depth_threshold <= 0.0:
+            raise ValueError("pixelgs_depth_threshold must be a positive finite value")
+        # Camera matrices in this codebase use row-vector convention: the
+        # homogeneous world point is multiplied by world_view_transform.
+        # This statistic only controls densification and must not add a second
+        # gradient path into the optimized 3D means.
+        with torch.no_grad():
+            xyz = pc.get_xyz.detach()
+            view = viewpoint_camera.world_view_transform.to(
+                device=xyz.device, dtype=xyz.dtype
+            )
+            # Equivalent to [x,y,z,1] @ view followed by selecting z, without
+            # allocating an N x 4 homogeneous tensor (large at 5-6M points).
+            camera_depth = torch.matmul(xyz, view[:3, 2]) + view[3, 2]
+            pixelgs_grad_scale = camera_depth.div_(
+                absolute_depth_threshold
+            ).square_().clamp_(min=0.0, max=1.0)
+
     raster_settings_args = dict(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -74,6 +118,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
     if IMPROVED_GS_RASTERIZER_AVAILABLE:
         raster_settings_args["pixel_weights"] = pixel_weights
+    if PIXEL_GS_RASTERIZER_AVAILABLE:
+        raster_settings_args["track_pixel_counts"] = track_pixel_counts
     raster_settings = GaussianRasterizationSettings(**raster_settings_args)
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -136,11 +182,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
 
-    if pixel_weights is None:
+    if pixel_weights is None and not track_pixel_counts:
         rendered_image, radii, depth_image = raster_outputs
         accum_weights = None
-    else:
+        pixel_counts = None
+    elif pixel_weights is not None and not track_pixel_counts:
         rendered_image, radii, depth_image, accum_weights = raster_outputs
+        pixel_counts = None
+    elif pixel_weights is None and track_pixel_counts:
+        rendered_image, radii, depth_image, pixel_counts = raster_outputs
+        accum_weights = None
+    else:
+        rendered_image, radii, depth_image, accum_weights, pixel_counts = raster_outputs
         
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
@@ -159,5 +212,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         }
     if accum_weights is not None and accum_weights.numel() > 0:
         out["accum_weights"] = accum_weights
+    if track_pixel_counts:
+        pixel_counts = pixel_counts.reshape(-1)
+        if pixel_counts.numel() != pc.get_xyz.shape[0]:
+            raise RuntimeError(
+                "Pixel-GS rasterizer returned {} counts for {} Gaussians".format(
+                    pixel_counts.numel(), pc.get_xyz.shape[0]
+                )
+            )
+        out["pixel_counts"] = pixel_counts
+    if pixelgs_grad_scale is not None:
+        out["pixelgs_grad_scale"] = pixelgs_grad_scale
     
     return out

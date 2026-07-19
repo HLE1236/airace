@@ -850,6 +850,67 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
+    def add_densification_stats_pixelgs(
+        self,
+        viewspace_point_tensor,
+        update_filter,
+        pixel_counts,
+        depth_scale,
+    ):
+        """Accumulate Pixel-GS' pixel-aware, depth-scaled gradient score.
+
+        ``pixel_counts`` is the number of image pixels to which each Gaussian
+        contributed in the current view.  It weights both the numerator and
+        denominator, while ``depth_scale`` only attenuates the gradient in the
+        numerator for Gaussians close to the camera.
+        """
+        if viewspace_point_tensor.grad is None:
+            raise RuntimeError("View-space point gradients are unavailable; call after backward()")
+
+        num_gaussians = int(self.xyz_gradient_accum.shape[0])
+        device = self.xyz_gradient_accum.device
+        dtype = self.xyz_gradient_accum.dtype
+
+        counts = torch.as_tensor(pixel_counts, device=device, dtype=dtype).detach().reshape(-1)
+        scales = torch.as_tensor(depth_scale, device=device, dtype=dtype).detach().reshape(-1)
+        if counts.numel() != num_gaussians:
+            raise ValueError(
+                "pixel_counts must contain one value per Gaussian ({} != {})".format(
+                    counts.numel(), num_gaussians
+                )
+            )
+        if scales.numel() != num_gaussians:
+            raise ValueError(
+                "depth_scale must contain one value per Gaussian ({} != {})".format(
+                    scales.numel(), num_gaussians
+                )
+            )
+        if update_filter.dtype == torch.bool:
+            visible_mask = update_filter.reshape(-1).to(device=device)
+            if visible_mask.numel() != num_gaussians:
+                raise ValueError(
+                    "Boolean visibility mask must contain one value per Gaussian"
+                )
+            visible_indices = visible_mask.nonzero(as_tuple=False).reshape(-1)
+        else:
+            visible_indices = update_filter.reshape(-1).to(device=device, dtype=torch.long)
+        if visible_indices.numel() == 0:
+            return
+
+        # The rasterizer guarantees finite, non-negative counts and valid,
+        # unique visibility indices.  Avoid whole-N validation scans here: at
+        # HCM0204 scale they would synchronize the GPU on every training view.
+        visible_indices = visible_indices[counts[visible_indices] > 0]
+        gradients = viewspace_point_tensor.grad.to(device=device)
+        signed_gradient_norm = torch.norm(
+            gradients[visible_indices, :2], dim=-1, keepdim=True
+        ).to(dtype=dtype)
+        count_weights = counts[visible_indices, None]
+        self.xyz_gradient_accum[visible_indices] += (
+            signed_gradient_norm * count_weights * scales[visible_indices, None]
+        )
+        self.denom[visible_indices] += count_weights
+
     def add_densification_stats_abs(self, viewspace_point_tensor, update_filter):
         """Accumulate both signed and per-pixel absolute screen-space gradients.
 

@@ -102,6 +102,10 @@ class OptimizationParams(ParamGroup):
         # unchanged. Component switches intentionally use integer 0/1 values:
         # ParamGroup's store_true handling cannot disable a default-true bool.
         self.density_control = "3dgs"
+        # Pixel-GS scales the screen-space densification gradient for points
+        # close to the camera.  The absolute threshold used by the renderer is
+        # this scene-relative value multiplied by Scene.cameras_extent.
+        self.pixelgs_depth_threshold = 0.37
         self.use_las = 1
         self.use_rap = 1
         self.use_gc = 1

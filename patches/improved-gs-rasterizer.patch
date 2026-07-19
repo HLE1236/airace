@@ -90,21 +90,22 @@ index 4d02560..80f5238 100644
  		const float* dL_dinvdepth,
  		float* dL_dopacity,
 diff --git a/cuda_rasterizer/forward.cu b/cuda_rasterizer/forward.cu
-index c5e01dd..67b97bb 100644
+index c5e01dd..2c53a8c 100644
 --- a/cuda_rasterizer/forward.cu
 +++ b/cuda_rasterizer/forward.cu
-@@ -285,7 +285,9 @@ renderCUDA(
+@@ -285,7 +285,10 @@ renderCUDA(
  	const float* __restrict__ bg_color,
  	float* __restrict__ out_color,
  	const float* __restrict__ depths,
 -	float* __restrict__ invdepth)
 +	float* __restrict__ invdepth,
 +	const float* __restrict__ pixel_weights,
-+	float* __restrict__ accum_weights)
++	float* __restrict__ accum_weights,
++	float* __restrict__ pixel_counts)
  {
  	// Identify current tile and associated min/max pixel range.
  	auto block = cg::this_thread_block();
-@@ -374,6 +376,12 @@ renderCUDA(
+@@ -374,6 +377,18 @@ renderCUDA(
  			if(invdepth)
  			expected_invdepth += (1 / depths[collected_id[j]]) * alpha * T;
  
@@ -114,84 +115,96 @@ index c5e01dd..67b97bb 100644
 +			if (pixel_weights != nullptr && accum_weights != nullptr)
 +				atomicAdd(&accum_weights[collected_id[j]], pixel_weights[pix_id] * alpha * T);
 +
++			// Pixel-GS pixel-aware density control counts every pixel to which
++			// this Gaussian contributes after the standard alpha/transmittance
++			// gates. This is intentionally independent from the EAS weight.
++			if (pixel_counts != nullptr)
++				atomicAdd(&pixel_counts[collected_id[j]], 1.0f);
++
  			T = test_T;
  
  			// Keep track of last range entry to update this
-@@ -409,7 +417,9 @@ void FORWARD::render(
+@@ -409,7 +424,10 @@ void FORWARD::render(
  	const float* bg_color,
  	float* out_color,
  	float* depths,
 -	float* depth)
 +	float* depth,
 +	const float* pixel_weights,
-+	float* accum_weights)
++	float* accum_weights,
++	float* pixel_counts)
  {
  	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
  		ranges,
-@@ -423,7 +433,9 @@ void FORWARD::render(
+@@ -423,7 +441,10 @@ void FORWARD::render(
  		bg_color,
  		out_color,
  		depths, 
 -		depth);
 +		depth,
 +		pixel_weights,
-+		accum_weights);
++		accum_weights,
++		pixel_counts);
  }
  
  void FORWARD::preprocess(int P, int D, int M,
 diff --git a/cuda_rasterizer/forward.h b/cuda_rasterizer/forward.h
-index 5b18005..a0b75cd 100644
+index 5b18005..a2f1e3d 100644
 --- a/cuda_rasterizer/forward.h
 +++ b/cuda_rasterizer/forward.h
-@@ -62,7 +62,9 @@ namespace FORWARD
+@@ -62,7 +62,10 @@ namespace FORWARD
  		const float* bg_color,
  		float* out_color,
  		float* depths,
 -		float* depth);
 +		float* depth,
 +		const float* pixel_weights,
-+		float* accum_weights);
++		float* accum_weights,
++		float* pixel_counts);
  }
  
  
 diff --git a/cuda_rasterizer/rasterizer.h b/cuda_rasterizer/rasterizer.h
-index 64afdee..133b7ca 100644
+index 64afdee..4b977fc 100644
 --- a/cuda_rasterizer/rasterizer.h
 +++ b/cuda_rasterizer/rasterizer.h
-@@ -50,6 +50,8 @@ namespace CudaRasterizer
+@@ -50,6 +50,9 @@ namespace CudaRasterizer
  			const bool prefiltered,
  			float* out_color,
  			float* depth,
 +			const float* pixel_weights,
 +			float* accum_weights,
++			float* pixel_counts,
  			bool antialiasing,
  			int* radii = nullptr,
  			bool debug = false);
 diff --git a/cuda_rasterizer/rasterizer_impl.cu b/cuda_rasterizer/rasterizer_impl.cu
-index 41c4ed3..80f0bd8 100644
+index 41c4ed3..002b6cf 100644
 --- a/cuda_rasterizer/rasterizer_impl.cu
 +++ b/cuda_rasterizer/rasterizer_impl.cu
-@@ -217,6 +217,8 @@ int CudaRasterizer::Rasterizer::forward(
+@@ -217,6 +217,9 @@ int CudaRasterizer::Rasterizer::forward(
  	const bool prefiltered,
  	float* out_color,
  	float* depth,
 +	const float* pixel_weights,
 +	float* accum_weights,
++	float* pixel_counts,
  	bool antialiasing,
  	int* radii,
  	bool debug)
-@@ -335,7 +337,9 @@ int CudaRasterizer::Rasterizer::forward(
+@@ -335,7 +338,10 @@ int CudaRasterizer::Rasterizer::forward(
  		background,
  		out_color,
  		geomState.depths,
 -		depth), debug)
 +		depth,
 +		pixel_weights,
-+		accum_weights), debug)
++		accum_weights,
++		pixel_counts), debug)
  
  	return num_rendered;
  }
-@@ -411,7 +415,7 @@ void CudaRasterizer::Rasterizer::backward(
+@@ -411,7 +417,7 @@ void CudaRasterizer::Rasterizer::backward(
  		imgState.n_contrib,
  		dL_dpix,
  		dL_invdepths,
@@ -200,7 +213,7 @@ index 41c4ed3..80f0bd8 100644
  		(float4*)dL_dconic,
  		dL_dopacity,
  		dL_dcolor,
-@@ -436,7 +440,7 @@ void CudaRasterizer::Rasterizer::backward(
+@@ -436,7 +442,7 @@ void CudaRasterizer::Rasterizer::backward(
  		focal_x, focal_y,
  		tan_fovx, tan_fovy,
  		(glm::vec3*)campos,
@@ -210,7 +223,7 @@ index 41c4ed3..80f0bd8 100644
  		dL_dinvdepth,
  		dL_dopacity,
 diff --git a/diff_gaussian_rasterization/__init__.py b/diff_gaussian_rasterization/__init__.py
-index 7f228ce..0205818 100644
+index 7f228ce..71f12f9 100644
 --- a/diff_gaussian_rasterization/__init__.py
 +++ b/diff_gaussian_rasterization/__init__.py
 @@ -29,7 +29,7 @@ def rasterize_gaussians(
@@ -222,20 +235,23 @@ index 7f228ce..0205818 100644
          means3D,
          means2D,
          sh,
-@@ -40,6 +40,12 @@ def rasterize_gaussians(
+@@ -40,6 +40,15 @@ def rasterize_gaussians(
          cov3Ds_precomp,
          raster_settings,
      )
-+    # Keep the public API compatible with the original rasterizer.  The
-+    # per-Gaussian accumulation is only exposed when pixel weights are
-+    # explicitly requested (Improved-GS EAS).
-+    if raster_settings.pixel_weights is None:
-+        return result[:3]
-+    return result
++    # Keep the public API compatible with the original rasterizer. Auxiliary
++    # per-Gaussian outputs are only exposed when their feature is requested:
++    # EAS accumulation first, then Pixel-GS coverage counts.
++    outputs = list(result[:3])
++    if raster_settings.pixel_weights is not None:
++        outputs.append(result[3])
++    if raster_settings.track_pixel_counts:
++        outputs.append(result[4])
++    return tuple(outputs)
  
  class _RasterizeGaussians(torch.autograd.Function):
      @staticmethod
-@@ -56,6 +62,21 @@ class _RasterizeGaussians(torch.autograd.Function):
+@@ -56,6 +65,21 @@ class _RasterizeGaussians(torch.autograd.Function):
          raster_settings,
      ):
  
@@ -257,17 +273,18 @@ index 7f228ce..0205818 100644
          # Restructure arguments the way that the C++ lib expects them
          args = (
              raster_settings.bg, 
-@@ -77,20 +98,23 @@ class _RasterizeGaussians(torch.autograd.Function):
+@@ -77,20 +101,24 @@ class _RasterizeGaussians(torch.autograd.Function):
              raster_settings.campos,
              raster_settings.prefiltered,
              raster_settings.antialiasing,
 +            pixel_weights,
++            raster_settings.track_pixel_counts,
              raster_settings.debug
          )
  
          # Invoke C++/CUDA rasterizer
 -        num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, invdepths = _C.rasterize_gaussians(*args)
-+        num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, invdepths, accum_weights = _C.rasterize_gaussians(*args)
++        num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, invdepths, accum_weights, pixel_counts = _C.rasterize_gaussians(*args)
  
          # Keep relevant tensors for backward
          ctx.raster_settings = raster_settings
@@ -275,16 +292,16 @@ index 7f228ce..0205818 100644
 +        ctx.means2D_columns = means2D.shape[1]
          ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, opacities, geomBuffer, binningBuffer, imgBuffer)
 -        return color, radii, invdepths
-+        ctx.mark_non_differentiable(radii, accum_weights)
-+        return color, radii, invdepths, accum_weights
++        ctx.mark_non_differentiable(radii, accum_weights, pixel_counts)
++        return color, radii, invdepths, accum_weights, pixel_counts
  
      @staticmethod
 -    def backward(ctx, grad_out_color, _, grad_out_depth):
-+    def backward(ctx, grad_out_color, _, grad_out_depth, _grad_accum_weights):
++    def backward(ctx, grad_out_color, _, grad_out_depth, _grad_accum_weights, _grad_pixel_counts):
  
          # Restore necessary values from context
          num_rendered = ctx.num_rendered
-@@ -126,6 +150,17 @@ class _RasterizeGaussians(torch.autograd.Function):
+@@ -126,6 +154,17 @@ class _RasterizeGaussians(torch.autograd.Function):
          # Compute gradients for relevant tensors by invoking backward method
          grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)        
  
@@ -302,16 +319,17 @@ index 7f228ce..0205818 100644
          grads = (
              grad_means3D,
              grad_means2D,
-@@ -154,6 +189,7 @@ class GaussianRasterizationSettings(NamedTuple):
+@@ -154,6 +193,8 @@ class GaussianRasterizationSettings(NamedTuple):
      prefiltered : bool
      debug : bool
      antialiasing : bool
 +    pixel_weights : torch.Tensor = None
++    track_pixel_counts : bool = False
  
  class GaussianRasterizer(nn.Module):
      def __init__(self, raster_settings):
 diff --git a/rasterize_points.cu b/rasterize_points.cu
-index e625c19..a47212f 100644
+index e625c19..d292d31 100644
 --- a/rasterize_points.cu
 +++ b/rasterize_points.cu
 @@ -32,7 +32,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
@@ -319,19 +337,20 @@ index e625c19..a47212f 100644
  }
  
 -std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
++std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansCUDA(
  	const torch::Tensor& background,
  	const torch::Tensor& means3D,
-@@ -53,6 +53,7 @@ RasterizeGaussiansCUDA(
+@@ -53,6 +53,8 @@ RasterizeGaussiansCUDA(
  	const torch::Tensor& campos,
  	const bool prefiltered,
  	const bool antialiasing,
 +	const torch::Tensor& pixel_weights,
++	const bool track_pixel_counts,
  	const bool debug)
  {
    if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
-@@ -74,6 +75,21 @@ RasterizeGaussiansCUDA(
+@@ -74,6 +76,29 @@ RasterizeGaussiansCUDA(
    out_invdepthptr = out_invdepth.data<float>();
  
    torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
@@ -350,25 +369,34 @@ index e625c19..a47212f 100644
 +	pixel_weight_ptr = pixel_weights.data_ptr<float>();
 +	accum_weight_ptr = accum_weights.data_ptr<float>();
 +  }
++
++  float* pixel_count_ptr = nullptr;
++  torch::Tensor pixel_counts = torch::empty({0}, float_opts);
++  if (track_pixel_counts)
++  {
++	pixel_counts = torch::zeros({P}, float_opts).contiguous();
++	pixel_count_ptr = pixel_counts.data_ptr<float>();
++  }
    
    torch::Device device(torch::kCUDA);
    torch::TensorOptions options(torch::kByte);
-@@ -116,11 +132,13 @@ RasterizeGaussiansCUDA(
+@@ -116,11 +141,14 @@ RasterizeGaussiansCUDA(
  		prefiltered,
  		out_color.contiguous().data<float>(),
  		out_invdepthptr,
 +		pixel_weight_ptr,
 +		accum_weight_ptr,
++		pixel_count_ptr,
  		antialiasing,
  		radii.contiguous().data<int>(),
  		debug);
    }
 -  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth);
-+  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth, accum_weights);
++  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth, accum_weights, pixel_counts);
  }
  
  std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-@@ -161,7 +179,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
+@@ -161,7 +189,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
    }
  
    torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
@@ -380,7 +408,7 @@ index e625c19..a47212f 100644
    torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means3D.options());
    torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
 diff --git a/rasterize_points.h b/rasterize_points.h
-index 82cbd4f..bde7fe4 100644
+index 82cbd4f..e2f12ea 100644
 --- a/rasterize_points.h
 +++ b/rasterize_points.h
 @@ -15,7 +15,7 @@
@@ -388,16 +416,16 @@ index 82cbd4f..bde7fe4 100644
  #include <string>
  	
 -std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
++std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansCUDA(
  	const torch::Tensor& background,
  	const torch::Tensor& means3D,
-@@ -36,6 +36,7 @@ RasterizeGaussiansCUDA(
+@@ -36,6 +36,8 @@ RasterizeGaussiansCUDA(
  	const torch::Tensor& campos,
  	const bool prefiltered,
  	const bool antialiasing,
 +	const torch::Tensor& pixel_weights,
++	const bool track_pixel_counts,
  	const bool debug);
  
  std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-
