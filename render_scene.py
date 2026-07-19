@@ -196,7 +196,7 @@ def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w
 import json
 import random
 
-def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration, orig_dir, supersample_factor=1.0, ensemble_iters="", jitter_samples=1, use_exposure=False, sharpen_amount=0.0, jpeg_quality=95):
+def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration, orig_dir, supersample_factor=1.0, ensemble_iters="", jitter_samples=1, use_exposure=False, sharpen_amount=0.0, jpeg_quality=95, apply_denoise=False, apply_color_match=False):
     iters_to_load = [int(x) for x in ensemble_iters.split(",")] if ensemble_iters else [iteration]
     gaussians_list = []
     loaded_iters = []
@@ -333,10 +333,33 @@ def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration
 
             out_path = scene_dir / img_name
             
-            if sharpen_amount > 0 or jpeg_quality > 0:
+            if sharpen_amount > 0 or jpeg_quality > 0 or apply_denoise or apply_color_match:
                 import torchvision.transforms.functional as TF
                 from PIL import ImageFilter
                 img_pil = TF.to_pil_image(rendering.clamp(0.0, 1.0))
+                
+                if apply_denoise:
+                    import cv2
+                    import numpy as np
+                    img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+                    img_cv = cv2.fastNlMeansDenoisingColored(img_cv, None, h=3, hColor=3, templateWindowSize=7, searchWindowSize=21)
+                    img_pil = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+                    
+                if apply_color_match and orig_dir:
+                    import cv2
+                    import numpy as np
+                    try:
+                        from skimage.exposure import match_histograms
+                        orig_img_path = Path(orig_dir) / scene_name / row["image_name"]
+                        if orig_img_path.exists():
+                            ref_img = cv2.imread(str(orig_img_path))
+                            if ref_img is not None:
+                                ref_img = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
+                                src_img = np.array(img_pil)
+                                matched = match_histograms(src_img, ref_img, channel_axis=-1)
+                                img_pil = Image.fromarray(matched.astype(np.uint8))
+                    except ImportError:
+                        pass
                 
                 if sharpen_amount > 0:
                     percent = int(sharpen_amount * 100)
@@ -372,6 +395,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_exposure", action="store_true")
     parser.add_argument("--sharpen_amount", default=0.0, type=float)
     parser.add_argument("--jpeg_quality", default=95, type=int)
+    parser.add_argument("--apply_denoise", action="store_true")
+    parser.add_argument("--apply_color_match", action="store_true")
 
     args = get_combined_args(parser)
 
@@ -392,5 +417,7 @@ if __name__ == "__main__":
         jitter_samples=args.jitter_samples,
         use_exposure=args.use_exposure,
         sharpen_amount=args.sharpen_amount,
-        jpeg_quality=args.jpeg_quality
+        jpeg_quality=args.jpeg_quality,
+        apply_denoise=args.apply_denoise,
+        apply_color_match=args.apply_color_match
     )

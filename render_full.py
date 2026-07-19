@@ -23,6 +23,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_exposure", action="store_true", help="Apply exposure compensation from exposure.json")
     parser.add_argument("--sharpen_amount", default=0.0, type=float, help="UnsharpMask percent (e.g. 0.3 for 30%)")
     parser.add_argument("--jpeg_quality", default=95, type=int, help="Save as JPEG with this quality and 4:4:4. If 0, saves as PNG/default.")
+    parser.add_argument("--apply_denoise", action="store_true", help="Apply Non-Local Means Denoising to the render")
+    parser.add_argument("--apply_color_match", action="store_true", help="Apply Histogram Matching with GT (if orig_dir provided)")
     
     args = parser.parse_args()
 
@@ -78,6 +80,10 @@ if __name__ == "__main__":
             cmd.extend(["--sharpen_amount", str(args.sharpen_amount)])
         if args.jpeg_quality > 0:
             cmd.extend(["--jpeg_quality", str(args.jpeg_quality)])
+        if args.apply_denoise:
+            cmd.append("--apply_denoise")
+        if args.apply_color_match:
+            cmd.append("--apply_color_match")
             
         cmd += args.extra_args
 
