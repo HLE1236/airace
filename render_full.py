@@ -14,8 +14,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--subset", nargs="+", default=[])
-    parser.add_argument("--extra_args", nargs="*", default=[])
-    args = parser.parse_args()
+    args, extra_args = parser.parse_known_args()
+    args.extra_args = extra_args
 
     scenes = sorted([
         d for d in os.listdir(args.input_dir)
