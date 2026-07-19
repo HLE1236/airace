@@ -354,6 +354,7 @@ def render_scene(
     jpeg_quality=95,
     jpeg_subsampling=2,
     jpeg_optimize=False,
+    supersample_factor=1.0,
 ):
     gaussians, loaded_iter = load_gaussians(dataset, iteration)
     test_poses_csv = Path(input_dir) / scene_name / "test" / "test_poses.csv" 
@@ -425,11 +426,11 @@ def render_scene(
     redistortion_grid = None
     if abs(dist["k"]) > 1e-8:
         redistortion_grid = build_redistortion_grid(
-            und["height"],
-            und["width"],
-            f=und["f"],
-            cx=und["cx"],
-            cy=und["cy"],
+            int(und["height"] * supersample_factor),
+            int(und["width"] * supersample_factor),
+            f=und["f"] * supersample_factor,
+            cx=und["cx"] * supersample_factor,
+            cy=und["cy"] * supersample_factor,
             k=dist["k"],
             device=background.device,
         )
@@ -441,8 +442,10 @@ def render_scene(
         for idx, row in enumerate(tqdm(rows, desc=f"Rendering {scene_name}")):
             camera = camera_from_csv_row(
                 row, idx, dataset.data_device,
-                width=und["width"], height=und["height"],
-                fx=und["f"], fy=und["f"],
+                width=int(und["width"] * supersample_factor), 
+                height=int(und["height"] * supersample_factor),
+                fx=und["f"] * supersample_factor, 
+                fy=und["f"] * supersample_factor,
             )
             base_rendering = render(
                 camera,
@@ -483,19 +486,26 @@ def render_scene(
                 if redistortion_grid is not None:
                     warped = redistort_and_crop(
                         base_rendering,
-                        f=und["f"],
-                        cx_render=und["cx"],
-                        cy_render=und["cy"],
+                        f=und["f"] * supersample_factor,
+                        cx_render=und["cx"] * supersample_factor,
+                        cy_render=und["cy"] * supersample_factor,
                         k=dist["k"],
-                        cx_orig=dist["cx"],
-                        cy_orig=dist["cy"],
-                        orig_w=dist["width"],
-                        orig_h=dist["height"],
+                        cx_orig=dist["cx"] * supersample_factor,
+                        cy_orig=dist["cy"] * supersample_factor,
+                        orig_w=int(dist["width"] * supersample_factor),
+                        orig_h=int(dist["height"] * supersample_factor),
                         interpolation=interpolation,
                         grid=redistortion_grid,
                     )
                 else:
                     warped = base_rendering
+
+                if supersample_factor != 1.0:
+                    warped = torch.nn.functional.interpolate(
+                        warped.unsqueeze(0),
+                        size=(int(dist["height"]), int(dist["width"])),
+                        mode="area"
+                    ).squeeze(0)
 
                 for variant_name, spec_interpolation, spec_amount in variant_specs:
                     if spec_interpolation != interpolation:
@@ -562,6 +572,7 @@ if __name__ == "__main__":
     parser.add_argument("--jpeg_subsampling", type=int, choices=(0, 1, 2), default=2)
     parser.add_argument("--jpeg_optimize", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--supersample_factor", type=float, default=1.0)
 
     args = get_combined_args(parser)
 
@@ -585,4 +596,5 @@ if __name__ == "__main__":
         jpeg_quality=args.jpeg_quality,
         jpeg_subsampling=args.jpeg_subsampling,
         jpeg_optimize=args.jpeg_optimize,
+        supersample_factor=args.supersample_factor,
     )
