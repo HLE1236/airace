@@ -563,13 +563,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--redistort_interpolation",
         choices=("bilinear", "bicubic"),
-        default="bilinear",
+        default="bicubic",  # optimal: bicubic > bilinear
     )
-    parser.add_argument("--sharpen_amount", type=float, default=0.0)
+    parser.add_argument("--sharpen_amount", type=float, default=1.0)   # optimal sweep: 1.0
     parser.add_argument("--variant_sharpen_amount", type=float, default=0.3)
-    parser.add_argument("--sharpen_sigma", type=float, default=0.7)
-    parser.add_argument("--jpeg_quality", type=int, default=95)
-    parser.add_argument("--jpeg_subsampling", type=int, choices=(0, 1, 2), default=2)
+    parser.add_argument("--sharpen_sigma", type=float, default=0.60)   # optimal sweep: 0.60
+    parser.add_argument("--jpeg_quality", type=int, default=100)       # lossless quality
+    parser.add_argument("--jpeg_subsampling", type=int, choices=(0, 1, 2), default=0)  # optimal: 4:4:4
     parser.add_argument("--jpeg_optimize", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--supersample_factor", type=float, default=1.0)
