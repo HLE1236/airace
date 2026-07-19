@@ -17,11 +17,11 @@ if __name__ == "__main__":
     parser.add_argument("--extra_args", nargs="*", default=[])
     
     # Advanced rendering options
-    parser.add_argument("--supersample_factor", default=1.0, type=float, help="Scale factor for supersampling")
+    parser.add_argument("--supersample_factor", default=1.5, type=float, help="Scale factor for supersampling")
     parser.add_argument("--ensemble_iters", default="", type=str, help="Comma-separated iterations to average (e.g. 29000,30000)")
-    parser.add_argument("--jitter_samples", default=1, type=int, help="Number of sub-pixel jitter samples for SSAA")
+    parser.add_argument("--jitter_samples", default=4, type=int, help="Number of sub-pixel jitter samples for SSAA")
     parser.add_argument("--use_exposure", action="store_true", help="Apply exposure compensation from exposure.json")
-    parser.add_argument("--sharpen_amount", default=0.0, type=float, help="UnsharpMask percent (e.g. 0.3 for 30%)")
+    parser.add_argument("--sharpen_amount", default=0.2, type=float, help="UnsharpMask percent (e.g. 0.3 for 30%)")
     parser.add_argument("--jpeg_quality", default=100, type=int, help="Save as JPEG with this quality and 4:4:4. If 0, saves as PNG/default.")
     
     args = parser.parse_args()
