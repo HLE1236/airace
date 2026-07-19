@@ -8,7 +8,6 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Render all scenes with trained 3DGS")
     parser.add_argument("--orig_dir", default="/kaggle/input/datasets/xuanph/phase1/phase1/private_set1")
     parser.add_argument("--model_dir", default="/kaggle/working/model_outputs")
-    parser.add_argument("--orig_dir", default=None)
     parser.add_argument("--input_dir", default="/kaggle/working/cleaned_inputs")
     parser.add_argument("--image_dir", default="/kaggle/working/image_outputs")
     parser.add_argument("--iterations", default=-1, type=int)
@@ -65,8 +64,6 @@ if __name__ == "__main__":
             "--iterations", str(args.iterations),
             "--orig_dir", args.orig_dir,
         ]
-        if hasattr(args, "orig_dir") and args.orig_dir:
-            cmd.extend(["--orig_dir", args.orig_dir])
         if args.quiet:
             cmd.append("--quiet")
         if args.supersample_factor != 1.0:
