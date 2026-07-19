@@ -196,7 +196,7 @@ def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w
 import json
 import random
 
-def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration, orig_dir, supersample_factor=1.0, ensemble_iters="", jitter_samples=1, use_exposure=False, sharpen_amount=0.0, jpeg_quality=0):
+def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration, orig_dir, supersample_factor=1.0, ensemble_iters="", jitter_samples=1, use_exposure=False, sharpen_amount=0.0, jpeg_quality=100):
     iters_to_load = [int(x) for x in ensemble_iters.split(",")] if ensemble_iters else [iteration]
     gaussians_list = []
     loaded_iters = []
@@ -371,7 +371,7 @@ if __name__ == "__main__":
     parser.add_argument("--jitter_samples", default=1, type=int)
     parser.add_argument("--use_exposure", action="store_true")
     parser.add_argument("--sharpen_amount", default=0.0, type=float)
-    parser.add_argument("--jpeg_quality", default=0, type=int)
+    parser.add_argument("--jpeg_quality", default=100, type=int)
 
     args = get_combined_args(parser)
 

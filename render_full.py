@@ -22,7 +22,7 @@ if __name__ == "__main__":
     parser.add_argument("--jitter_samples", default=1, type=int, help="Number of sub-pixel jitter samples for SSAA")
     parser.add_argument("--use_exposure", action="store_true", help="Apply exposure compensation from exposure.json")
     parser.add_argument("--sharpen_amount", default=0.0, type=float, help="UnsharpMask percent (e.g. 0.3 for 30%)")
-    parser.add_argument("--jpeg_quality", default=0, type=int, help="Save as JPEG with this quality and 4:4:4. If 0, saves as PNG/default.")
+    parser.add_argument("--jpeg_quality", default=100, type=int, help="Save as JPEG with this quality and 4:4:4. If 0, saves as PNG/default.")
     
     args = parser.parse_args()
 
