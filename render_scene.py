@@ -14,6 +14,7 @@ from gaussian_renderer import GaussianModel, render
 from scene.cameras import Camera
 from scene.colmap_loader import qvec2rotmat, read_intrinsics_binary
 from utils.graphics_utils import focal2fov
+from utils.image_utils import save_render_jpeg
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import safe_state
 import torch.nn.functional as F

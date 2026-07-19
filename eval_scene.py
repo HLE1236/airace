@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 from argparse import ArgumentParser
 
-
 import torch
 import torchvision.transforms.functional as tf
 from PIL import Image
@@ -11,7 +10,7 @@ from tqdm import tqdm
 
 from utils.loss_utils import ssim
 from utils.image_utils import psnr
-from lpipsPyTorch import lpips
+from lpipsPyTorch.modules.lpips import LPIPS
 
 
 def read_image(path):
@@ -39,6 +38,7 @@ def eval_scene(gt_path, sample_path):
         raise RuntimeError(f"Không có file khớp tên giữa {gt_path} và {sample_path}")
 
     ssims, psnrs, lpipss = [], [], []
+    lpips_model = LPIPS(net_type='alex').cuda()
 
     for stem in tqdm(common_stems, desc="Evaluating"):
         gt_img = read_image(gt_path / gt_map[stem])
@@ -46,7 +46,7 @@ def eval_scene(gt_path, sample_path):
 
         ssims.append(ssim(sample_img, gt_img).item())
         psnrs.append(psnr(sample_img, gt_img).item())
-        lpipss.append(lpips(sample_img, gt_img, net_type='alex').item())
+        lpipss.append(lpips_model(sample_img, gt_img).item())
 
     return {
         "num_images": len(common_stems),
