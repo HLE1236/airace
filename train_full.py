@@ -21,11 +21,24 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--density_control",
-        choices=("3dgs", "pixelgs", "improvedgs"),
+        choices=("3dgs", "pixelgs", "improvedgs", "mcmc"),
         default="3dgs",
     )
     parser.add_argument("--pixelgs_depth_threshold", type=float, default=0.37)
     parser.add_argument("--gaussian_budget", type=int, default=1_500_000)
+    parser.add_argument("--mcmc_noise_lr", type=float, default=500_000.0)
+    parser.add_argument("--mcmc_opacity_reg", type=float, default=0.01)
+    parser.add_argument("--mcmc_scale_reg", type=float, default=0.01)
+    parser.add_argument("--mcmc_growth_rate", type=float, default=1.05)
+    parser.add_argument("--mcmc_min_opacity", type=float, default=0.005)
+    parser.add_argument("--mcmc_noise_chunk_size", type=int, default=250_000)
+    parser.add_argument(
+        "--mcmc_init_type", choices=("random", "sfm"), default="random"
+    )
+    parser.add_argument("--mcmc_random_points", type=int, default=100_000)
+    parser.add_argument(
+        "--mcmc_init_mode", choices=("paper", "legacy"), default="paper"
+    )
     parser.add_argument("--use_las", type=int, choices=(0, 1), default=1)
     parser.add_argument("--use_rap", type=int, choices=(0, 1), default=1)
     parser.add_argument("--use_gc", type=int, choices=(0, 1), default=1)
@@ -120,6 +133,18 @@ if __name__ == "__main__":
                 "--mu_interval", str(args.mu_interval),
                 "--mu_second_start_iter", str(args.mu_second_start_iter),
                 "--mu_second_interval", str(args.mu_second_interval),
+            ])
+        elif args.density_control == "mcmc":
+            cmd.extend([
+                "--mcmc_noise_lr", str(args.mcmc_noise_lr),
+                "--mcmc_opacity_reg", str(args.mcmc_opacity_reg),
+                "--mcmc_scale_reg", str(args.mcmc_scale_reg),
+                "--mcmc_growth_rate", str(args.mcmc_growth_rate),
+                "--mcmc_min_opacity", str(args.mcmc_min_opacity),
+                "--mcmc_noise_chunk_size", str(args.mcmc_noise_chunk_size),
+                "--mcmc_init_type", args.mcmc_init_type,
+                "--mcmc_random_points", str(args.mcmc_random_points),
+                "--mcmc_init_mode", args.mcmc_init_mode,
             ])
 
         # Keep the escape hatch last so an explicitly supplied option wins.

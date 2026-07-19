@@ -22,6 +22,27 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--stop_after_iteration",
+        type=int,
+        default=-1,
+        help=(
+            "Stop this process after the requested iteration while preserving the "
+            "full --iterations schedule. Intended for staged Kaggle runs."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint_keep_last",
+        type=int,
+        default=0,
+        help="Keep only the newest N method checkpoints; 0 keeps every checkpoint.",
+    )
+    parser.add_argument(
+        "--stats_path",
+        type=str,
+        default=None,
+        help="Optional JSONL path for MCMC growth, loss, and peak-VRAM telemetry.",
+    )
     parser.add_argument("--cap_max", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--quiet", action="store_true")
@@ -66,4 +87,7 @@ if __name__ == "__main__":
         args.debug_from,
         args.cap_max,
         seed=args.seed,
+        stop_after_iteration=args.stop_after_iteration,
+        checkpoint_keep_last=args.checkpoint_keep_last,
+        stats_path=args.stats_path,
     )

@@ -41,7 +41,29 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
+            mcmc_enabled = bool(getattr(args, "mcmc_enabled", False))
+            scene_info = sceneLoadTypeCallbacks["Colmap"](
+                args.source_path,
+                args.images,
+                args.depths,
+                args.eval,
+                args.train_test_exp,
+                init_type=(
+                    str(getattr(args, "mcmc_init_type", "random"))
+                    if mcmc_enabled
+                    else "sfm"
+                ),
+                num_pts=(
+                    int(getattr(args, "mcmc_random_points", 100_000))
+                    if mcmc_enabled
+                    else 100_000
+                ),
+                init_seed=(
+                    int(getattr(args, "mcmc_init_seed", 0))
+                    if mcmc_enabled
+                    else 0
+                ),
+            )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)

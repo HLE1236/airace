@@ -149,7 +149,39 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def _mcmc_random_point_cloud(radius, num_points=100_000, seed=0):
+    """Reproduce the official random COLMAP-scene initialization."""
+    radius = float(radius)
+    num_points = int(num_points)
+    seed = int(seed)
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("MCMC random initialization requires a positive radius")
+    if num_points <= 0:
+        raise ValueError("mcmc_random_points must be positive")
+    if seed < 0:
+        raise ValueError("MCMC initialization seed must be non-negative")
+    rng = np.random.RandomState(seed)
+    xyz = rng.random_sample((num_points, 3)) * (6.0 * radius) - (3.0 * radius)
+    shs = rng.random_sample((num_points, 3)) / 255.0
+    colors = SH2RGB(shs)
+    return BasicPointCloud(
+        points=xyz,
+        colors=colors,
+        normals=np.zeros((num_points, 3)),
+    )
+
+
+def readColmapSceneInfo(
+    path,
+    images,
+    depths,
+    eval,
+    train_test_exp,
+    llffhold=8,
+    init_type="sfm",
+    num_pts=100_000,
+    init_seed=0,
+):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -209,19 +241,53 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    init_type = str(init_type).lower()
+    if init_type == "sfm":
+        ply_path = os.path.join(path, "sparse/0/points3D.ply")
+        bin_path = os.path.join(path, "sparse/0/points3D.bin")
+        txt_path = os.path.join(path, "sparse/0/points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
+    elif init_type == "random":
+        num_pts = int(num_pts)
+        init_seed = int(init_seed)
+        ply_path = os.path.join(
+            path, "mcmc_random_{}_seed{}.ply".format(num_pts, init_seed)
+        )
+        # The radius is derived from the cameras, so do not trust a stale cache
+        # merely because seed/count happen to match. Regeneration is cheap for
+        # 100K points and an atomic replace also repairs interrupted prior runs.
+        print("Generating MCMC random point cloud ({})...".format(num_pts))
+        random_pcd = _mcmc_random_point_cloud(
+            nerf_normalization["radius"], num_pts, init_seed
+        )
+        temporary_ply_path = "{}.{}.tmp".format(ply_path, os.getpid())
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
+            storePly(
+                temporary_ply_path,
+                random_pcd.points,
+                random_pcd.colors * 255.0,
+            )
+            os.replace(temporary_ply_path, ply_path)
+        finally:
+            if os.path.exists(temporary_ply_path):
+                os.remove(temporary_ply_path)
+    else:
+        raise ValueError("MCMC init_type must be 'random' or 'sfm'")
     try:
         pcd = fetchPly(ply_path)
-    except:
+    except Exception as error:
+        if init_type == "random":
+            raise RuntimeError(
+                "Failed to read the generated MCMC random point cloud: {}".format(
+                    ply_path
+                )
+            ) from error
         pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,

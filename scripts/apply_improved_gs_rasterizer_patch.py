@@ -1,4 +1,4 @@
-"""Apply the tracked Improved-GS/Pixel-GS rasterizer patch to the submodule.
+"""Apply the tracked Improved-GS/Pixel-GS/MCMC rasterizer patch.
 
 The CUDA rasterizer is an upstream Git submodule, so edits inside it are not
 stored by commits in this parent repository.  This helper makes a fresh
@@ -31,7 +31,9 @@ def _git_apply(*arguments: str) -> subprocess.CompletedProcess[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Apply or verify the Improved-GS/Pixel-GS CUDA rasterizer patch."
+        description=(
+            "Apply or verify the Improved-GS/Pixel-GS/MCMC CUDA rasterizer patch."
+        )
     )
     parser.add_argument(
         "--check-only",
@@ -50,13 +52,13 @@ def main() -> int:
 
     already_applied = _git_apply("--reverse", "--check")
     if already_applied.returncode == 0:
-        print("Improved-GS/Pixel-GS rasterizer patch is already applied.")
+        print("Improved-GS/Pixel-GS/MCMC rasterizer patch is already applied.")
         return 0
 
     if args.check_only:
         print(
-            "Improved-GS/Pixel-GS rasterizer patch is not applied. Run this script "
-            "without --check-only before building the extension.",
+            "Improved-GS/Pixel-GS/MCMC rasterizer patch is not applied. Run "
+            "this script without --check-only before building the extension.",
             file=sys.stderr,
         )
         return 1
@@ -77,7 +79,10 @@ def main() -> int:
         print("Failed to apply rasterizer patch:\n{}".format(details), file=sys.stderr)
         return applied.returncode
 
-    print("Applied Improved-GS AbsGrad/EAS and Pixel-GS coverage rasterizer patch.")
+    print(
+        "Applied Improved-GS AbsGrad/EAS, Pixel-GS coverage, and MCMC "
+        "relocation rasterizer patch."
+    )
     print("Rebuild submodules/diff-gaussian-rasterization before training.")
     return 0
 
