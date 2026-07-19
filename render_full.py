@@ -6,8 +6,8 @@ from pathlib import Path
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Render all scenes with trained 3DGS")
-    parser.add_argument("--orig_dir", default="/kaggle/input/datasets/xuanph/phase1/phase1/private_set1")
     parser.add_argument("--model_dir", default="/kaggle/working/model_outputs")
+    parser.add_argument("--orig_dir", default=None)
     parser.add_argument("--input_dir", default="/kaggle/working/cleaned_inputs")
     parser.add_argument("--image_dir", default="/kaggle/working/image_outputs")
     parser.add_argument("--iterations", default=-1, type=int)
@@ -15,17 +15,6 @@ if __name__ == "__main__":
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--subset", nargs="+", default=[])
     parser.add_argument("--extra_args", nargs="*", default=[])
-    
-    # Advanced rendering options
-    parser.add_argument("--supersample_factor", default=1.0, type=float, help="Scale factor for supersampling")
-    parser.add_argument("--ensemble_iters", default="", type=str, help="Comma-separated iterations to average (e.g. 29000,30000)")
-    parser.add_argument("--jitter_samples", default=1, type=int, help="Number of sub-pixel jitter samples for SSAA")
-    parser.add_argument("--use_exposure", action="store_true", help="Apply exposure compensation from exposure.json")
-    parser.add_argument("--sharpen_amount", default=0.0, type=float, help="UnsharpMask percent (e.g. 0.3 for 30%)")
-    parser.add_argument("--jpeg_quality", default=95, type=int, help="Save as JPEG with this quality and 4:4:4. If 0, saves as PNG/default.")
-    parser.add_argument("--apply_denoise", action="store_true", help="Apply Non-Local Means Denoising to the render")
-    parser.add_argument("--apply_color_match", action="store_true", help="Apply Histogram Matching with GT (if orig_dir provided)")
-    
     args = parser.parse_args()
 
     scenes = sorted([
@@ -64,27 +53,11 @@ if __name__ == "__main__":
             "--image_dir", args.image_dir,
             "--scene_name", scene,
             "--iterations", str(args.iterations),
-            "--orig_dir", args.orig_dir,
         ]
+        if hasattr(args, "orig_dir") and args.orig_dir:
+            cmd.extend(["--orig_dir", args.orig_dir])
         if args.quiet:
             cmd.append("--quiet")
-        if args.supersample_factor != 1.0:
-            cmd.extend(["--supersample_factor", str(args.supersample_factor)])
-        if args.ensemble_iters:
-            cmd.extend(["--ensemble_iters", args.ensemble_iters])
-        if args.jitter_samples > 1:
-            cmd.extend(["--jitter_samples", str(args.jitter_samples)])
-        if args.use_exposure:
-            cmd.append("--use_exposure")
-        if args.sharpen_amount > 0:
-            cmd.extend(["--sharpen_amount", str(args.sharpen_amount)])
-        if args.jpeg_quality > 0:
-            cmd.extend(["--jpeg_quality", str(args.jpeg_quality)])
-        if args.apply_denoise:
-            cmd.append("--apply_denoise")
-        if args.apply_color_match:
-            cmd.append("--apply_color_match")
-            
         cmd += args.extra_args
 
         ret = subprocess.run(cmd)

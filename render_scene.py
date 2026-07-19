@@ -14,6 +14,7 @@ from gaussian_renderer import GaussianModel, render
 from scene.cameras import Camera
 from scene.colmap_loader import qvec2rotmat, read_intrinsics_binary
 from utils.graphics_utils import focal2fov
+from utils.image_utils import save_render_jpeg
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import safe_state
 import torch.nn.functional as F
@@ -108,84 +109,89 @@ def load_undistorted_camera_params(input_dir, scene_name):
                 width=cam.width, height=cam.height)
 
 
-_redistort_cache = {}
+def redistort_image(img, f, cx, cy, k, num_iters=15):
+    """img: tensor [C,H,W] (anh render "undistorted", canvas mo rong) -> anh da meo theo k.
 
-def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w, orig_h, num_iters=15):
-    """
-    img: tensor [C,H,W] la anh render tren canvas "undistorted" da mo rong.
-    Kich thuoc (H,W) va tam quang hoc (cx_render,cy_render) phai KHOP voi camera PINHOLE render.
-    cx_orig, cy_orig, orig_w, orig_h: intrinsics + kich thuoc anh GOC/GT (distorted), dung de crop.
-    
-    Ban toi uu: Cache lai grid mapping r_d = r_u + k*r_u^3 va cac toa do crop vi
-    chung hoan toan GIONG NHAU cho tat ca cac frame cua cung mot camera model trong cung 1 scene.
+    Giai nguoc r_d = r_u + k*r_u^3 bang Newton's method tren ban kinh (giong het
+    experiment_distort.py) -- on dinh hon fixed-point iteration cu tren x,y rieng le,
+    dac biet o vung ria canvas mo rong hoac khi k lon.
     """
     C, H, W = img.shape
     device = img.device
 
-    cache_key = (H, W, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w, orig_h, str(device), num_iters)
+    ys, xs = torch.meshgrid(
+        torch.arange(H, device=device, dtype=torch.float32),
+        torch.arange(W, device=device, dtype=torch.float32),
+        indexing="ij",
+    )
+    xd = (xs - cx) / f
+    yd = (ys - cy) / f
+    rd = torch.sqrt(xd * xd + yd * yd)
 
-    if cache_key not in _redistort_cache:
-        # 1. Giai nguoc r_d = r_u + k*r_u^3 bang Newton's method
-        ys, xs = torch.meshgrid(
-            torch.arange(H, device=device, dtype=torch.float32),
-            torch.arange(W, device=device, dtype=torch.float32),
-            indexing="ij",
-        )
-        xd = (xs - cx_render) / f
-        yd = (ys - cy_render) / f
-        rd = torch.sqrt(xd * xd + yd * yd)
+    ru = rd.clone()
+    for _ in range(num_iters):
+        g = k * ru**3 + ru - rd
+        g_prime = 3 * k * ru**2 + 1
+        g_prime = torch.where(g_prime.abs() < 1e-12, torch.full_like(g_prime, 1e-12), g_prime)
+        ru = ru - g / g_prime
 
-        ru = rd.clone()
-        for _ in range(num_iters):
-            g = k * ru**3 + ru - rd
-            g_prime = 3 * k * ru**2 + 1
-            g_prime = torch.where(g_prime.abs() < 1e-12, torch.full_like(g_prime, 1e-12), g_prime)
-            ru = ru - g / g_prime
+    scale = torch.where(rd > 1e-12, ru / rd, torch.ones_like(rd))
 
-        scale = torch.where(rd > 1e-12, ru / rd, torch.ones_like(rd))
-        xu = xd * scale
-        yu = yd * scale
+    xu = xd * scale
+    yu = yd * scale
 
-        u_src = xu * f + cx_render
-        v_src = yu * f + cy_render
+    u_src = xu * f + cx
+    v_src = yu * f + cy
 
-        grid_x = (u_src / (W - 1)) * 2 - 1
-        grid_y = (v_src / (H - 1)) * 2 - 1
-        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-
-        # 2. Tinh toan cac toa do crop
-        offset_x = int(round(cx_render - cx_orig))
-        offset_y = int(round(cy_render - cy_orig))
-
-        x0 = max(offset_x, 0)
-        y0 = max(offset_y, 0)
-        x1 = min(offset_x + orig_w, W)
-        y1 = min(offset_y + orig_h, H)
-
-        if x0 >= x1 or y0 >= y1:
-            raise ValueError(
-                f"Crop window rong/vuot canvas: offset=({offset_x},{offset_y}) "
-                f"canvas=({W}x{H}) target=({orig_w}x{orig_h})"
-            )
-
-        pad_top = y0 - offset_y
-        pad_left = x0 - offset_x
-        pad_bottom = orig_h - (y1 - y0) - pad_top
-        pad_right = orig_w - (x1 - x0) - pad_left
-
-        _redistort_cache[cache_key] = (grid, x0, y0, x1, y1, pad_left, pad_right, pad_top, pad_bottom)
-
-    # 3. Su dung thong so da cache de mapping anh hien tai
-    grid, x0, y0, x1, y1, pad_left, pad_right, pad_top, pad_bottom = _redistort_cache[cache_key]
+    grid_x = (u_src / (W - 1)) * 2 - 1
+    grid_y = (v_src / (H - 1)) * 2 - 1
+    grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
 
     out = F.grid_sample(
-        img.unsqueeze(0), grid, mode="bicubic",
+        img.unsqueeze(0), grid, mode="bilinear",
         padding_mode="zeros", align_corners=True,
-    ).squeeze(0)
+    )
+    return out.squeeze(0)
 
-    cropped = out[:, y0:y1, x0:x1]
 
-    if pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0:
+def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w, orig_h, num_iters=15):
+    """
+    img: tensor [C,H,W] la anh render tren canvas "undistorted" da mo rong -- kich thuoc
+         (H,W) va tam quang hoc (cx_render,cy_render) phai KHOP voi camera PINHOLE that su
+         dung de render (doc tu load_undistorted_camera_params), khong duoc gia dinh la
+         W/2,H/2 vi COLMAP undistort co the khong dat tam dung giua canvas mo rong.
+    cx_orig, cy_orig, orig_w, orig_h: intrinsics + kich thuoc anh GOC/GT (distorted, tu
+         cameras.bin SIMPLE_RADIAL truoc undistort), dung de crop lai dung khung nhu GT.
+
+    Tra ve: anh da redistort VA da crop ve dung (orig_h, orig_w), giong pattern trong
+    experiment_distort.py (undistort -> redistort_full -> crop bang offset giua 2 tam).
+    """
+    distorted_full = redistort_image(img, f=f, cx=cx_render, cy=cy_render, k=k, num_iters=num_iters)
+
+    _, H, W = distorted_full.shape
+    offset_x = int(round(cx_render - cx_orig))
+    offset_y = int(round(cy_render - cy_orig))
+
+    x0 = max(offset_x, 0)
+    y0 = max(offset_y, 0)
+    x1 = min(offset_x + orig_w, W)
+    y1 = min(offset_y + orig_h, H)
+
+    if x0 >= x1 or y0 >= y1:
+        raise ValueError(
+            f"Crop window rong/vuot canvas: offset=({offset_x},{offset_y}) "
+            f"canvas=({W}x{H}) target=({orig_w}x{orig_h})"
+        )
+
+    cropped = distorted_full[:, y0:y1, x0:x1]
+
+    # Neu offset am hoac canvas render nho hon target (khong nen xay ra neu undistort
+    # dung max_scale du lon), pad zero cho khop kich thuoc goc thay vi silently resize.
+    if cropped.shape[1] != orig_h or cropped.shape[2] != orig_w:
+        pad_top = y0 - offset_y
+        pad_left = x0 - offset_x
+        pad_bottom = orig_h - cropped.shape[1] - pad_top
+        pad_right = orig_w - cropped.shape[2] - pad_left
         cropped = F.pad(
             cropped, (pad_left, pad_right, pad_top, pad_bottom),
             mode="constant", value=0,
@@ -193,37 +199,58 @@ def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w
 
     return cropped
 
-import json
-import random
-
-def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration, orig_dir, supersample_factor=1.0, ensemble_iters="", jitter_samples=1, use_exposure=False, sharpen_amount=0.0, jpeg_quality=95, apply_denoise=False, apply_color_match=False):
-    iters_to_load = [int(x) for x in ensemble_iters.split(",")] if ensemble_iters else [iteration]
-    gaussians_list = []
-    loaded_iters = []
-    for it in iters_to_load:
-        g, loaded_it = load_gaussians(dataset, it)
-        gaussians_list.append(g)
-        loaded_iters.append(str(loaded_it))
-    
+def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration, orig_dir):
+    gaussians, loaded_iter = load_gaussians(dataset, iteration)
     scene_dir = Path(output_dir) / scene_name
     test_poses_csv = Path(input_dir) / scene_name / "test" / "test_poses.csv" 
     scene_dir.mkdir(parents=True, exist_ok=True)
 
+    #VAR: load cameras intrinsic for distortion factor (anh GOC, truoc undistort)
     dist = load_distortion_params(orig_dir, scene_name)
-    print(f"[{scene_name}] distortion k={dist['k']:.6f} f={dist['f']:.2f} cx={dist['cx']:.2f} cy={dist['cy']:.2f} size=({dist['width']}x{dist['height']})")
+    print(f"[{scene_name}] distortion k={dist['k']:.6f} f={dist['f']:.2f} "
+          f"cx={dist['cx']:.2f} cy={dist['cy']:.2f} size=({dist['width']}x{dist['height']})")
 
+    # VAR: camera PINHOLE da undistort (canvas mo rong) -- dung camera nay de RENDER,
+    # khong dung width/height/fx/fy trong CSV (do la kich thuoc GT goc).
     und = load_undistorted_camera_params(input_dir, scene_name)
-    print(f"[{scene_name}] undistorted render canvas f={und['f']:.2f} cx={und['cx']:.2f} cy={und['cy']:.2f} size=({und['width']}x{und['height']})")
+    print(f"[{scene_name}] undistorted render canvas f={und['f']:.2f} "
+          f"cx={und['cx']:.2f} cy={und['cy']:.2f} size=({und['width']}x{und['height']})")
+    
 
-    exposure_dict = {}
-    if use_exposure:
-        exposure_file = Path(dataset.model_path) / "exposure.json"
-        if exposure_file.exists():
-            with open(exposure_file, "r") as f:
-                exposure_dict = json.load(f)
-            print(f"Loaded exposure compensation for {len(exposure_dict)} images.")
-        else:
-            print(f"Warning: --use_exposure is set but {exposure_file} not found.")
+    # #====================================================================================================================
+    # print(f"[{scene_name}] dist: k={dist['k']:.8f} f={dist['f']:.3f} "
+    #     f"size=({dist['width']}x{dist['height']})")
+    # print(f"[{scene_name}] und : f={und['f']:.3f} "
+    #     f"size=({und['width']}x{und['height']})")
+
+    # # So sanh f_undist vs f_orig -- thuat toan redistort_and_crop dang GIA DINH 2 gia tri
+    # # nay xap xi bang nhau (chi lech cx,cy do canvas mo rong). Neu lech nhieu, do cong
+    # # tinh ra se bi sai ty le.
+    # f_diff_pct = abs(und['f'] - dist['f']) / dist['f'] * 100
+    # print(f"f_undist vs f_orig: diff={und['f']-dist['f']:+.3f}  ({f_diff_pct:.2f}%)")
+
+    # # Ban kinh chuan hoa tai GOC anh (worst case that su, khong phai mep giua canh)
+    # # vi diem xa tam quang hoc nhat luon nam o 4 goc, khong phai mep ngang/doc.
+    # rd_edge_mid = (dist['width'] / 2) / dist['f']          # mep giua canh ngang (cu, thieu)
+    # rd_corner = np.sqrt((dist['width'] / 2) ** 2 + (dist['height'] / 2) ** 2) / dist['f']  # goc anh
+
+    # for label, rd in [("mep giua canh", rd_edge_mid), ("goc anh (worst case)", rd_corner)]:
+    #     delta = dist['k'] * rd ** 3
+    #     pct = abs(delta) / rd * 100
+    #     print(f"  rd={rd:.4f} tai [{label}]: k*rd^3={delta:.6f}  (lech {pct:.2f}% so voi rd)")
+
+    # # Kiem tra vung invalid (chi xay ra khi k < 0): neu rd_corner > rd_max, nghia la
+    # # 4 goc anh GOC nam trong vung KHONG CO NGHIEM THAT khi redistort -- day la vung
+    # # se bi mat/den neu code xu ly dung (giong het ảnh 2 cua experiment_distort.py).
+    # if dist['k'] < 0:
+    #     ru_max = np.sqrt(-1.0 / (3 * dist['k']))
+    #     rd_max = ru_max + dist['k'] * ru_max ** 3
+    #     print(f"k<0 -> rd_max (nguong co nghiem)={rd_max:.4f}")
+    #     print(f"  rd_corner ({rd_corner:.4f}) {'VUOT NGUONG -> co vung invalid o goc anh' if rd_corner > rd_max else 'trong nguong, khong co vung invalid'}")
+    # else:
+    #     print("k >= 0 -> khong co vung invalid (chi xay ra khi k<0)")
+
+    # #=============================================================================================================
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -231,152 +258,76 @@ def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration
     with open(test_poses_csv, newline="") as f:
         rows = list(csv.DictReader(f))
 
-    # Determine jitter offsets
-    if jitter_samples == 1:
-        offsets = [(0.0, 0.0)]
-    elif jitter_samples == 4:
-        offsets = [(-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25), (0.25, 0.25)]
-    else:
-        offsets = [(random.uniform(-0.5, 0.5), random.uniform(-0.5, 0.5)) for _ in range(jitter_samples)]
-
     with torch.no_grad():
         for idx, row in enumerate(tqdm(rows, desc=f"Rendering {scene_name}")):
-            img_name = row["image_name"]
-            
-            # Exposure matrix for this image
-            matrix = None
-            if use_exposure and img_name in exposure_dict:
-                matrix = torch.tensor(exposure_dict[img_name], device="cuda", dtype=torch.float32)
+            camera = camera_from_csv_row(
+                row, idx, dataset.data_device,
+                width=und["width"], height=und["height"],
+                fx=und["f"], fy=und["f"],
+            )
+            rendering = render(
+                camera,
+                gaussians,
+                pipeline,
+                background,
+                use_trained_exp=dataset.train_test_exp,
+                separate_sh=SPARSE_ADAM_AVAILABLE,
+            )["render"]
 
-            final_accum = None
-            total_samples = len(gaussians_list) * len(offsets)
+            # if idx == 0:
+            #     # VAR-DEBUG: ve luoi len anh render TRUOC khi redistort, de kiem tra
+            #     # warp phi tuyen co thuc su xay ra hay chi la tinh tien (crop offset).
+            #     debug_grid = rendering.clone()
+            #     C, Hc, Wc = debug_grid.shape
+            #     step = 50
+            #     for gx in range(0, Wc, step):
+            #         debug_grid[:, :, gx] = torch.tensor([1.0, 0.0, 0.0], device=debug_grid.device).view(3, 1)
+            #     for gy in range(0, Hc, step):
+            #         debug_grid[:, gy, :] = torch.tensor([1.0, 0.0, 0.0], device=debug_grid.device).view(3, 1)
 
-            for gaussians in gaussians_list:
-                for dx, dy in offsets:
-                    # Apply sub-pixel offset to principal point
-                    cx_new = und["cx"] + dx
-                    cy_new = und["cy"] + dy
-                    
-                    camera = camera_from_csv_row(
-                        row, idx, dataset.data_device,
-                        width=int(und["width"] * supersample_factor), 
-                        height=int(und["height"] * supersample_factor),
-                        fx=und["f"] * supersample_factor, 
-                        fy=und["f"] * supersample_factor,
-                    )
-                    
-                    # Override camera centers manually for 3DGS if needed. 
-                    # Note: standard 3DGS uses principal point exactly at image center.
-                    # Since we use `focal2fov` which assumes centered cx/cy, we might need a custom projection matrix 
-                    # to shift it, BUT the 3DGS pipeline `render` uses `camera.projection_matrix`.
-                    # Actually, our `camera_from_csv_row` doesn't pass cx, cy! So 3DGS always centers it.
-                    # TO JITTER 3DGS exactly, we'd need to modify `camera.projection_matrix` directly.
-                    # Let's skip modifying 3DGS projection matrix directly to avoid bugs, and jitter by shifting 
-                    # the redistort mapping. 
-                    # That means 3DGS renders exactly the same, but we sample it with a sub-pixel shifted grid!
-                    # This is valid because we are sampling from a high-freq continuous representation.
-                    
-                    # Re-create camera just in case
-                    camera = camera_from_csv_row(
-                        row, idx, dataset.data_device,
-                        width=int(und["width"] * supersample_factor), 
-                        height=int(und["height"] * supersample_factor),
-                        fx=und["f"] * supersample_factor, 
-                        fy=und["f"] * supersample_factor,
-                    )
-                    
-                    rendering = render(
-                        camera,
-                        gaussians,
-                        pipeline,
-                        background,
-                        use_trained_exp=dataset.train_test_exp,
-                        separate_sh=SPARSE_ADAM_AVAILABLE,
-                    )["render"]
+            #     debug_grid_after = redistort_and_crop(
+            #         debug_grid,
+            #         f=und["f"], cx_render=und["cx"], cy_render=und["cy"],
+            #         k=dist["k"],
+            #         cx_orig=dist["cx"], cy_orig=dist["cy"],
+            #         orig_w=dist["width"], orig_h=dist["height"],
+            #     )
+            #     torchvision.utils.save_image(debug_grid, "/kaggle/working/debug_grid_before.png")
+            #     torchvision.utils.save_image(debug_grid_after, "/kaggle/working/debug_grid_after.png")
 
-                    if abs(dist["k"]) > 1e-8:
-                        # Redistort using the jittered cx_new and cy_new
-                        rendering = redistort_and_crop(
-                            rendering,
-                            f=und["f"] * supersample_factor,
-                            cx_render=cx_new * supersample_factor,
-                            cy_render=cy_new * supersample_factor,
-                            k=dist["k"],
-                            cx_orig=dist["cx"] * supersample_factor,
-                            cy_orig=dist["cy"] * supersample_factor,
-                            orig_w=int(dist["width"] * supersample_factor),
-                            orig_h=int(dist["height"] * supersample_factor),
-                        )
+            # VAR: redistort tren canvas mo rong (dung intrinsics cua chinh canvas do:
+            # und["f"], und["cx"], und["cy"]) roi crop ve dung kich thuoc GT goc
+            # (dist["width"], dist["height"]) bang offset giua 2 tam quang hoc --
+            # giong het pattern trong experiment_distort.py.
+            if abs(dist["k"]) > 1e-8:
+                # rendering_before = rendering.clone()
+                rendering = redistort_and_crop(
+                    rendering,
+                    f=und["f"],
+                    cx_render=und["cx"],
+                    cy_render=und["cy"],
+                    k=dist["k"],
+                    cx_orig=dist["cx"],
+                    cy_orig=dist["cy"],
+                    orig_w=dist["width"],
+                    orig_h=dist["height"],
+                )
+                # # THEMMM
+                # if idx == 0:
+                #     # crop rendering_before ve cung kich thuoc de so sanh cho cong bang
+                #     _, Hc, Wc = rendering.shape
+                #     crop_before = rendering_before[:, :Hc, :Wc]  # crop tho, chi de debug
+                #     diff = (rendering - crop_before).abs()
+                #     print(f"[DEBUG] redistort diff: mean={diff.mean().item():.6f} "
+                #         f"max={diff.max().item():.6f}")
+                #     torchvision.utils.save_image(rendering_before, "/kaggle/working/debug_before_redistort.png")
+                #     torchvision.utils.save_image(rendering, "/kaggle/working/debug_after_redistort.png")
 
-                    # Accumulate
-                    if final_accum is None:
-                        final_accum = rendering / total_samples
-                    else:
-                        final_accum += rendering / total_samples
+            out_path = scene_dir / row["image_name"]
+            save_render_jpeg(rendering, out_path, quality=95)
+            del camera, rendering
 
-            rendering = final_accum
-
-            if supersample_factor != 1.0:
-                target_h = int(round(rendering.shape[1] / supersample_factor))
-                target_w = int(round(rendering.shape[2] / supersample_factor))
-                rendering = F.interpolate(
-                    rendering.unsqueeze(0), 
-                    size=(target_h, target_w), 
-                    mode="area"
-                ).squeeze(0)
-            # Apply exposure compensation
-            if matrix is not None:
-                C, H, W = rendering.shape
-                r_flat = rendering.view(3, -1)
-                r_flat = torch.matmul(matrix[:, :3], r_flat) + matrix[:, 3:4]
-                rendering = r_flat.view(3, H, W).clamp(0, 1)
-
-            out_path = scene_dir / img_name
-            
-            if sharpen_amount > 0 or jpeg_quality > 0 or apply_denoise or apply_color_match:
-                import torchvision.transforms.functional as TF
-                from PIL import ImageFilter
-                img_pil = TF.to_pil_image(rendering.clamp(0.0, 1.0))
-                
-                if apply_denoise:
-                    import cv2
-                    import numpy as np
-                    img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-                    img_cv = cv2.fastNlMeansDenoisingColored(img_cv, None, h=3, hColor=3, templateWindowSize=7, searchWindowSize=21)
-                    img_pil = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
-                    
-                if apply_color_match and orig_dir:
-                    import cv2
-                    import numpy as np
-                    try:
-                        from skimage.exposure import match_histograms
-                        orig_img_path = Path(orig_dir) / scene_name / row["image_name"]
-                        if orig_img_path.exists():
-                            ref_img = cv2.imread(str(orig_img_path))
-                            if ref_img is not None:
-                                ref_img = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
-                                src_img = np.array(img_pil)
-                                matched = match_histograms(src_img, ref_img, channel_axis=-1)
-                                img_pil = Image.fromarray(matched.astype(np.uint8))
-                    except ImportError:
-                        pass
-                
-                if sharpen_amount > 0:
-                    percent = int(sharpen_amount * 100)
-                    img_pil = img_pil.filter(ImageFilter.UnsharpMask(radius=0.7, percent=percent, threshold=0))
-                
-                if jpeg_quality > 0:
-                    out_path = out_path.with_suffix('.jpg')
-                    img_pil.save(out_path, quality=jpeg_quality, subsampling=0, optimize=True)
-                else:
-                    img_pil.save(out_path)
-            else:
-                torchvision.utils.save_image(rendering, out_path)
-                
-            del camera, rendering, final_accum
-
-    iters_str = ",".join(loaded_iters)
-    print(f"Rendered {len(rows)} images for {scene_name} from iteration(s) {iters_str} -> {scene_dir}")
+    print(f"Rendered {len(rows)} images for {scene_name} from iteration {loaded_iter} -> {scene_dir}")
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Render VAR scene with trained 3DGS")
@@ -389,14 +340,6 @@ if __name__ == "__main__":
     parser.add_argument("--image_dir", default="/kaggle/working/image_outputs")
     parser.add_argument("--scene_name", required=True)
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--supersample_factor", default=1.0, type=float)
-    parser.add_argument("--ensemble_iters", default="", type=str)
-    parser.add_argument("--jitter_samples", default=1, type=int)
-    parser.add_argument("--use_exposure", action="store_true")
-    parser.add_argument("--sharpen_amount", default=0.0, type=float)
-    parser.add_argument("--jpeg_quality", default=95, type=int)
-    parser.add_argument("--apply_denoise", action="store_true")
-    parser.add_argument("--apply_color_match", action="store_true")
 
     args = get_combined_args(parser)
 
@@ -411,13 +354,5 @@ if __name__ == "__main__":
         args.image_dir,
         args.scene_name,
         args.iterations,
-        args.orig_dir,
-        supersample_factor=args.supersample_factor,
-        ensemble_iters=args.ensemble_iters,
-        jitter_samples=args.jitter_samples,
-        use_exposure=args.use_exposure,
-        sharpen_amount=args.sharpen_amount,
-        jpeg_quality=args.jpeg_quality,
-        apply_denoise=args.apply_denoise,
-        apply_color_match=args.apply_color_match
+        args.orig_dir
     )
