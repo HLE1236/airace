@@ -77,13 +77,24 @@ def load_gaussians(dataset, iteration):
 
 # VAR: redistored
 def load_distortion_params(orig_dir, scene_name):
-    """Đọc camera SIMPLE_RADIAL gốc (chưa undistort) từ orig_dir"""
+    """Đọc camera gốc (chưa undistort) từ orig_dir"""
     cameras_bin = Path(orig_dir) / scene_name / "train" / "sparse" / "0" / "cameras.bin"
     cams = read_intrinsics_binary(str(cameras_bin))
     assert len(cams) == 1, f"Expect exactly 1 camera, got {len(cams)}"
     cam = next(iter(cams.values()))
-    assert cam.model == "SIMPLE_RADIAL", f"Unsupported model: {cam.model}"
-    f, cx, cy, k = cam.params
+    
+    k = 0.0
+    if cam.model == "SIMPLE_RADIAL":
+        f, cx, cy, k = cam.params
+    elif cam.model == "SIMPLE_PINHOLE":
+        f, cx, cy = cam.params
+    elif cam.model == "PINHOLE":
+        fx, fy, cx, cy = cam.params
+        assert abs(fx - fy) < 1e-3, f"PINHOLE fx != fy ({fx} vs {fy})"
+        f = fx
+    else:
+        raise ValueError(f"Unsupported model: {cam.model}")
+        
     return dict(f=float(f), cx=float(cx), cy=float(cy), k=float(k),
                 width=cam.width, height=cam.height)
 
