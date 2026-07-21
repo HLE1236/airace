@@ -117,8 +117,8 @@ def generate_alpha_masks_and_embed_from_original(orig_image_dir, orig_sparse_dir
     orig_sparse_dir = Path(orig_sparse_dir)
     undistorted_image_dir = Path(undistorted_image_dir)
 
-    white_dir = Path(tempfile.mkdtemp(prefix="white_src_"))
-    mask_out_dir = Path(tempfile.mkdtemp(prefix="white_undist_"))
+    white_dir = Path(tempfile.mkdtemp(prefix="white_src_", dir=undistorted_image_dir.parent))
+    mask_out_dir = Path(tempfile.mkdtemp(prefix="white_undist_", dir=undistorted_image_dir.parent))
 
     try:
         image_names = sorted(os.listdir(orig_image_dir))
@@ -197,14 +197,14 @@ def undistort_scene(scene_path, blank_pixels=1.0, min_scale=1.0, max_scale=2.0, 
     image_dir = scene_path / "train" / "images"
     sparse_dir = scene_path / "train" / "sparse" / "0"
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="undistort_"))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="undistort_", dir=scene_path.parent))
     orig_backup_dir = None
 
     try:
         if embed_alpha_mask:
             # Giu ban copy anh + sparse GOC (SIMPLE_RADIAL) truoc khi bi ghi de,
             # vi buoc sinh mask can warp field dung CHINH sparse model goc nay.
-            orig_backup_dir = Path(tempfile.mkdtemp(prefix="orig_backup_"))
+            orig_backup_dir = Path(tempfile.mkdtemp(prefix="orig_backup_", dir=scene_path.parent))
             shutil.copytree(image_dir, orig_backup_dir / "images")
             shutil.copytree(sparse_dir, orig_backup_dir / "sparse0")
 
