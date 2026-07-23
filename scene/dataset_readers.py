@@ -243,16 +243,40 @@ def readColmapSceneInfo(
 
     init_type = str(init_type).lower()
     if init_type == "sfm":
-        ply_path = os.path.join(path, "sparse/0/points3D.ply")
+        dense_ply_path = os.path.join(path, "dense/fused.ply")
+        sparse_ply_path = os.path.join(path, "sparse/0/points3D.ply")
         bin_path = os.path.join(path, "sparse/0/points3D.bin")
         txt_path = os.path.join(path, "sparse/0/points3D.txt")
-        if not os.path.exists(ply_path):
-            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-            try:
-                xyz, rgb, _ = read_points3D_binary(bin_path)
-            except:
-                xyz, rgb, _ = read_points3D_text(txt_path)
-            storePly(ply_path, xyz, rgb)
+        
+        if os.path.exists(dense_ply_path):
+            print(f"Found dense point cloud: {dense_ply_path}")
+            ply_path = dense_ply_path
+        else:
+            ply_path = sparse_ply_path
+            if not os.path.exists(ply_path):
+                print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+                try:
+                    xyz, rgb, errors = read_points3D_binary(bin_path)
+                except:
+                    xyz, rgb, errors = read_points3D_text(txt_path)
+                
+                # Filter sparse points
+                max_error = 8.0
+                std_multiplier = 3.0
+                mask = errors.flatten() < max_error
+                
+                centroid = xyz[mask].mean(axis=0)
+                distances = np.linalg.norm(xyz - centroid, axis=1)
+                mean_dist = distances[mask].mean()
+                std_dist = distances[mask].std()
+                mask &= distances < (mean_dist + std_multiplier * std_dist)
+                
+                removed = (~mask).sum()
+                print(f"Filtered {removed}/{len(xyz)} outlier points (max_error={max_error}, std={std_multiplier})")
+                
+                xyz_filtered = xyz[mask]
+                rgb_filtered = rgb[mask]
+                storePly(ply_path, xyz_filtered, rgb_filtered)
     elif init_type == "random":
         num_pts = int(num_pts)
         init_seed = int(init_seed)

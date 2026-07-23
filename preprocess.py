@@ -244,7 +244,56 @@ def undistort_scene(scene_path, blank_pixels=1.0, min_scale=1.0, max_scale=2.0, 
         if orig_backup_dir is not None:
             shutil.rmtree(orig_backup_dir, ignore_errors=True)
 
-def preprocess_dataset(path, output_dir, blank_pixels=1.0, min_scale=1.0, max_scale=2.0, subset = []):
+def dense_reconstruction(scene_path, gpu_index=0):
+    """Run COLMAP PatchMatch stereo + fusion to produce dense.ply"""
+    scene_path = Path(scene_path)
+    image_dir = scene_path / "train" / "images"
+    sparse_dir = scene_path / "train" / "sparse" / "0"
+    dense_dir = scene_path / "train" / "dense"
+    
+    dense_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"Creating dense workspace for {scene_path.name}...")
+    subprocess.run([
+        "colmap", "image_undistorter",
+        "--image_path", str(image_dir),
+        "--input_path", str(sparse_dir),
+        "--output_path", str(dense_dir),
+        "--output_type", "COLMAP",
+    ], check=True)
+    
+    print(f"Running PatchMatch Stereo for {scene_path.name}...")
+    subprocess.run([
+        "colmap", "patch_match_stereo",
+        "--workspace_path", str(dense_dir),
+        "--workspace_format", "COLMAP",
+        "--PatchMatchStereo.geom_consistency", "true",
+        "--PatchMatchStereo.gpu_index", str(gpu_index),
+        "--PatchMatchStereo.max_image_size", "2000",
+        "--PatchMatchStereo.window_radius", "5",
+        "--PatchMatchStereo.filter_min_ncc", "0.1",
+        "--PatchMatchStereo.num_iterations", "5",
+    ], check=True)
+    
+    dense_ply = dense_dir / "fused.ply"
+    print(f"Running Stereo Fusion for {scene_path.name}...")
+    subprocess.run([
+        "colmap", "stereo_fusion",
+        "--workspace_path", str(dense_dir),
+        "--workspace_format", "COLMAP",
+        "--output_path", str(dense_ply),
+        "--StereoFusion.min_num_pixels", "3",
+        "--StereoFusion.max_reproj_error", "2",
+    ], check=True)
+    
+    stereo_folder = dense_dir / "stereo"
+    if stereo_folder.exists():
+        print(f"Cleaning up heavy intermediate stereo files at {stereo_folder}...")
+        shutil.rmtree(stereo_folder, ignore_errors=True)
+        
+    return dense_ply
+
+def preprocess_dataset(path, output_dir, blank_pixels=1.0, min_scale=1.0, max_scale=2.0, subset=[], enable_dense=False):
     path = Path(path)
     output_dir = Path(output_dir)
 
@@ -260,6 +309,9 @@ def preprocess_dataset(path, output_dir, blank_pixels=1.0, min_scale=1.0, max_sc
                 embed_alpha_mask=True,
             )
             preprocess_scene(output_scene_path)
+            
+            if enable_dense:
+                dense_reconstruction(output_scene_path)
 
 def validate(path):
     path = Path(path)
@@ -325,10 +377,15 @@ if __name__ == "__main__":
         type=str,
         default=[]
     )
+    parser.add_argument(
+        "--enable_dense",
+        action="store_true",
+        help="Run COLMAP PatchMatch and Stereo Fusion to generate dense point cloud."
+    )
 
     args = parser.parse_args()
 
-    preprocess_dataset(args.input, args.output, subset=args.subset,)
+    preprocess_dataset(args.input, args.output, subset=args.subset, enable_dense=args.enable_dense)
     # validate(args.output)
 
 # preprocess_dataset(r"C:\contest\VAR2026\phase1\private_set1", r"C:\contest\VAR2026\dataset")
